@@ -287,6 +287,21 @@ def grant_demo_subscription(address: str) -> None:
         conn.commit()
 
 
+
+
+def session_cookie_options() -> dict:
+    """Cookie settings for Web3 login.
+
+    The dashboard can be embedded inside another site via iframe, so the
+    session cookie must support cross-site iframe usage on HTTPS. Set
+    WEB3_COOKIE_SECURE=0 only for local HTTP testing.
+    """
+    secure = os.getenv("WEB3_COOKIE_SECURE", "1").strip().lower() not in {"0", "false", "no", "off"}
+    samesite = os.getenv("WEB3_COOKIE_SAMESITE", "none").strip().lower()
+    if samesite not in {"lax", "strict", "none"}:
+        samesite = "none"
+    return {"httponly": True, "secure": secure, "samesite": samesite}
+
 def get_current_user(request: Request) -> Optional[dict]:
     token = request.cookies.get("msp_session")
     if not token:
@@ -1590,8 +1605,8 @@ async function connectWalletWithProvider(provider, providerName) {{
     }});
     const verifyData = await verifyRes.json();
     if (!verifyRes.ok) throw new Error(verifyData.error || 'Signature verification failed');
-    setWalletStatus('Wallet connected. Redirecting...', 'ok');
-    window.location.href='/?tab=profile';
+    setWalletStatus('Wallet connected. Loading profile...', 'ok');
+    window.location.replace('/?tab=profile&connected=1&t=' + Date.now());
   }} catch (e) {{
     const msg = (e && e.message) ? e.message : String(e);
     setWalletStatus(msg, 'bad');
@@ -2017,7 +2032,7 @@ async def web3_verify(request: Request):
             grant_demo_subscription(address)
         ensure_user_config(address)
         res = JSONResponse({"ok": True, "username": username, "address": address})
-        res.set_cookie("msp_session", token, httponly=True, secure=False, samesite="lax", max_age=30 * 24 * 3600)
+        res.set_cookie("msp_session", token, max_age=30 * 24 * 3600, **session_cookie_options())
         logger.info(f"✅ Web3 wallet login: {username} {short_addr(address)}")
         return res
     except Exception as e:
@@ -2050,7 +2065,7 @@ def web3_logout(request: Request):
             conn.execute("DELETE FROM web3_sessions WHERE token=?", (token,))
             conn.commit()
     res = RedirectResponse("/?tab=profile&msg=logout", status_code=303)
-    res.delete_cookie("msp_session")
+    res.delete_cookie("msp_session", secure=session_cookie_options()["secure"], samesite=session_cookie_options()["samesite"])
     return res
 
 
