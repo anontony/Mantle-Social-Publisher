@@ -744,7 +744,7 @@ def page_shell(tab: str, title: str, content: str, message: str = "", user: Opti
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <title>{esc(APP_NAME)}</title>
 <style>
 :root {{
@@ -929,6 +929,151 @@ option{{background:#14121e;color:var(--text)}}
   .card{{padding:16px;border-radius:22px}}
   .mobile-wallet{{max-width:92px}}
 }}
+
+/* Strict phone layout: optimized for iframe and real mobile browsers */
+@media(max-width:760px){{
+  html{{font-size:16px}}
+  body{{
+    width:100%;
+    min-width:0;
+    background:#08070c;
+  }}
+  body:before{{display:none}}
+  .mobile-topbar{{
+    min-height:58px;
+    padding:10px 12px;
+    background:rgba(8,7,12,.96);
+  }}
+  .mobile-menu-btn{{
+    width:42px;
+    min-height:42px;
+    font-size:22px;
+    flex:0 0 42px;
+  }}
+  .mobile-title{{
+    font-size:15px;
+    line-height:1.1;
+    text-align:center;
+    max-width:185px;
+  }}
+  .mobile-wallet{{
+    max-width:58px;
+    font-size:11px;
+  }}
+  .sidebar{{
+    width:min(86vw,300px);
+    top:8px;
+    bottom:8px;
+    left:8px;
+    padding:18px 14px;
+    border-radius:24px;
+  }}
+  .brand{{font-size:26px}}
+  .subbrand{{font-size:12px}}
+  .nav-section{{font-size:10px;margin:14px 8px 6px}}
+  .nav{{
+    min-height:44px;
+    padding:11px 13px;
+    margin:7px 0;
+    font-size:14px;
+    border-radius:15px;
+  }}
+  .main{{
+    padding:12px 10px 22px;
+    width:100%;
+    min-width:0;
+  }}
+  .header{{margin-bottom:10px}}
+  h1{{
+    font-size:25px;
+    line-height:1.08;
+    letter-spacing:-.04em;
+    margin:2px 0 8px;
+  }}
+  .desc{{
+    font-size:13px;
+    line-height:1.42;
+    max-width:100%;
+  }}
+  .card{{
+    margin:12px 0;
+    padding:15px;
+    border-radius:20px;
+    box-shadow:0 14px 34px rgba(0,0,0,.34);
+  }}
+  .card:before{{height:3px}}
+  .card h2,.card h3{{
+    font-size:18px;
+    line-height:1.18;
+    margin:2px 0 12px;
+  }}
+  .profile-grid,.workflow{{
+    display:grid!important;
+    grid-template-columns:1fr!important;
+    gap:10px!important;
+  }}
+  .metric,.step{{
+    padding:13px;
+    min-height:auto;
+    border-radius:16px;
+  }}
+  .metric span{{font-size:10px}}
+  .metric b{{font-size:15px;margin-top:6px}}
+  .step strong{{width:26px;height:26px;font-size:13px;margin-bottom:8px}}
+  .step h4{{font-size:14px}}
+  .step p,.help{{font-size:12px;line-height:1.42}}
+  fieldset{{
+    padding:12px;
+    margin:12px 0;
+    border-radius:18px;
+  }}
+  legend{{font-size:12px}}
+  .grid{{display:block}}
+  .grid label,label{{
+    font-size:13px;
+    line-height:1.25;
+  }}
+  .grid label{{margin:12px 0 6px}}
+  input,textarea,select{{
+    min-height:46px;
+    font-size:16px;
+    padding:12px 13px;
+    border-radius:14px;
+  }}
+  textarea{{min-height:118px}}
+  .secret-control input,.secret-control textarea{{padding-right:52px}}
+  .secret-toggle{{right:6px;width:38px;min-height:36px;border-radius:11px}}
+  .checkrow{{gap:8px;margin:12px 0 6px}}
+  .checkrow label{{
+    min-height:44px;
+    padding:10px 12px;
+    font-size:13px;
+    border-radius:14px;
+  }}
+  .actions{{display:grid;grid-template-columns:1fr;gap:9px;margin-top:12px}}
+  button,.button{{
+    width:100%;
+    min-height:46px;
+    padding:12px 14px;
+    font-size:14px;
+    border-radius:16px;
+  }}
+  pre{{
+    min-height:220px;
+    max-height:330px;
+    font-size:12px;
+    padding:12px;
+    border-radius:16px;
+  }}
+}}
+
+@media(max-width:380px){{
+  .main{{padding-left:8px;padding-right:8px}}
+  h1{{font-size:23px}}
+  .mobile-title{{font-size:14px;max-width:160px}}
+  .card{{padding:13px}}
+}}
+
 </style>
 </head>
 <body>
@@ -1089,6 +1234,151 @@ button[disabled]{{opacity:.45;cursor:not-allowed;transform:none!important;filter
 .account-table div:nth-child(even){{font-weight:850;overflow-wrap:anywhere}}
 @media(max-width:1100px){{.profile-hero,.workflow{{grid-template-columns:1fr}}.profile-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}
 @media(max-width:720px){{.profile-grid,.account-table{{grid-template-columns:1fr}}.credit-balance b{{font-size:38px}}}}
+
+/* Strict phone layout: optimized for iframe and real mobile browsers */
+@media(max-width:760px){{
+  html{{font-size:16px}}
+  body{{
+    width:100%;
+    min-width:0;
+    background:#08070c;
+  }}
+  body:before{{display:none}}
+  .mobile-topbar{{
+    min-height:58px;
+    padding:10px 12px;
+    background:rgba(8,7,12,.96);
+  }}
+  .mobile-menu-btn{{
+    width:42px;
+    min-height:42px;
+    font-size:22px;
+    flex:0 0 42px;
+  }}
+  .mobile-title{{
+    font-size:15px;
+    line-height:1.1;
+    text-align:center;
+    max-width:185px;
+  }}
+  .mobile-wallet{{
+    max-width:58px;
+    font-size:11px;
+  }}
+  .sidebar{{
+    width:min(86vw,300px);
+    top:8px;
+    bottom:8px;
+    left:8px;
+    padding:18px 14px;
+    border-radius:24px;
+  }}
+  .brand{{font-size:26px}}
+  .subbrand{{font-size:12px}}
+  .nav-section{{font-size:10px;margin:14px 8px 6px}}
+  .nav{{
+    min-height:44px;
+    padding:11px 13px;
+    margin:7px 0;
+    font-size:14px;
+    border-radius:15px;
+  }}
+  .main{{
+    padding:12px 10px 22px;
+    width:100%;
+    min-width:0;
+  }}
+  .header{{margin-bottom:10px}}
+  h1{{
+    font-size:25px;
+    line-height:1.08;
+    letter-spacing:-.04em;
+    margin:2px 0 8px;
+  }}
+  .desc{{
+    font-size:13px;
+    line-height:1.42;
+    max-width:100%;
+  }}
+  .card{{
+    margin:12px 0;
+    padding:15px;
+    border-radius:20px;
+    box-shadow:0 14px 34px rgba(0,0,0,.34);
+  }}
+  .card:before{{height:3px}}
+  .card h2,.card h3{{
+    font-size:18px;
+    line-height:1.18;
+    margin:2px 0 12px;
+  }}
+  .profile-grid,.workflow{{
+    display:grid!important;
+    grid-template-columns:1fr!important;
+    gap:10px!important;
+  }}
+  .metric,.step{{
+    padding:13px;
+    min-height:auto;
+    border-radius:16px;
+  }}
+  .metric span{{font-size:10px}}
+  .metric b{{font-size:15px;margin-top:6px}}
+  .step strong{{width:26px;height:26px;font-size:13px;margin-bottom:8px}}
+  .step h4{{font-size:14px}}
+  .step p,.help{{font-size:12px;line-height:1.42}}
+  fieldset{{
+    padding:12px;
+    margin:12px 0;
+    border-radius:18px;
+  }}
+  legend{{font-size:12px}}
+  .grid{{display:block}}
+  .grid label,label{{
+    font-size:13px;
+    line-height:1.25;
+  }}
+  .grid label{{margin:12px 0 6px}}
+  input,textarea,select{{
+    min-height:46px;
+    font-size:16px;
+    padding:12px 13px;
+    border-radius:14px;
+  }}
+  textarea{{min-height:118px}}
+  .secret-control input,.secret-control textarea{{padding-right:52px}}
+  .secret-toggle{{right:6px;width:38px;min-height:36px;border-radius:11px}}
+  .checkrow{{gap:8px;margin:12px 0 6px}}
+  .checkrow label{{
+    min-height:44px;
+    padding:10px 12px;
+    font-size:13px;
+    border-radius:14px;
+  }}
+  .actions{{display:grid;grid-template-columns:1fr;gap:9px;margin-top:12px}}
+  button,.button{{
+    width:100%;
+    min-height:46px;
+    padding:12px 14px;
+    font-size:14px;
+    border-radius:16px;
+  }}
+  pre{{
+    min-height:220px;
+    max-height:330px;
+    font-size:12px;
+    padding:12px;
+    border-radius:16px;
+  }}
+}}
+
+@media(max-width:380px){{
+  .main{{padding-left:8px;padding-right:8px}}
+  h1{{font-size:23px}}
+  .mobile-title{{font-size:14px;max-width:160px}}
+  .card{{padding:13px}}
+}}
+
 </style>
 
 <div class="profile-hero">
