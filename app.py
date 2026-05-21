@@ -789,7 +789,7 @@ body:before{{
   background-size:42px 42px;
   mask-image:linear-gradient(to bottom,rgba(0,0,0,.42),transparent 76%);
 }}
-.layout{{display:flex;min-height:100vh;position:relative;z-index:1}}
+.layout{{display:flex;min-height:100vh;position:relative}}
 .sidebar{{
   width:260px;
   background:var(--side);
@@ -816,7 +816,7 @@ body:before{{
 .subbrand{{font-size:13px;text-align:center;color:var(--muted);margin-bottom:26px;font-weight:700}}
 .nav-section{{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:#7d718f;font-weight:950;margin:20px 10px 8px}}
 .nav{{
-  display:flex;align-items:center;justify-content:center;min-height:48px;text-decoration:none;color:#d8c9ee;
+  display:flex;align-items:center;justify-content:center;min-height:48px;text-decoration:none;color:#d8c9ee;position:relative;z-index:2;pointer-events:auto;touch-action:manipulation;
   background:rgba(255,255,255,.045);border:1px solid var(--line);padding:13px 14px;margin:10px 0;text-align:center;border-radius:18px;font-weight:800;box-shadow:0 8px 20px rgba(0,0,0,.18);transition:transform .16s ease,box-shadow .16s ease,background .16s ease;
 }}
 .nav:hover{{transform:translateY(-1px);background:rgba(255,255,255,.08);box-shadow:0 12px 26px rgba(255,0,122,.16)}}
@@ -888,11 +888,11 @@ option{{background:#14121e;color:var(--text)}}
     border-bottom:1px solid var(--line);box-shadow:0 12px 30px rgba(0,0,0,.24);
   }}
   .mobile-overlay{{
-    display:block;position:fixed;inset:0;z-index:58;background:rgba(0,0,0,.55);opacity:0;pointer-events:none;transition:opacity .18s ease;
+    display:block;position:fixed;inset:0;z-index:40;background:rgba(0,0,0,.55);opacity:0;pointer-events:none;transition:opacity .18s ease;
   }}
   body.menu-open .mobile-overlay{{opacity:1;pointer-events:auto}}
   .sidebar{{
-    position:fixed;z-index:60;top:10px;bottom:10px;left:10px;right:auto;width:min(88vw,320px);height:auto;
+    position:fixed;z-index:80;top:10px;bottom:10px;left:10px;right:auto;width:min(88vw,320px);height:auto;pointer-events:auto;
     transform:translateX(calc(-100% - 22px));transition:transform .22s ease;margin:0;padding:22px 16px;border-radius:28px;overflow-y:auto;
   }}
   body.menu-open .sidebar{{transform:translateX(0)}}
@@ -962,6 +962,7 @@ option{{background:#14121e;color:var(--text)}}
   }}
   .sidebar{{
     width:min(86vw,300px);
+    z-index:80;
     top:8px;
     bottom:8px;
     left:8px;
@@ -1119,8 +1120,12 @@ document.addEventListener('DOMContentLoaded', () => {{
   const overlay = document.getElementById('mobileOverlay');
   const closeMenu = () => document.body.classList.remove('menu-open');
   if (menuBtn) menuBtn.addEventListener('click', () => document.body.classList.toggle('menu-open'));
+  const sidebar = document.querySelector('.sidebar');
   if (overlay) overlay.addEventListener('click', closeMenu);
-  document.querySelectorAll('.sidebar .nav').forEach((link) => link.addEventListener('click', closeMenu));
+  if (sidebar) sidebar.addEventListener('click', (event) => event.stopPropagation());
+  document.querySelectorAll('.sidebar .nav').forEach((link) => link.addEventListener('click', () => {{
+    document.body.classList.remove('menu-open');
+  }}));
 
   document.querySelectorAll('.secret-toggle').forEach((button) => {{
     button.addEventListener('click', () => {{
@@ -1267,6 +1272,7 @@ button[disabled]{{opacity:.45;cursor:not-allowed;transform:none!important;filter
   }}
   .sidebar{{
     width:min(86vw,300px);
+    z-index:80;
     top:8px;
     bottom:8px;
     left:8px;
