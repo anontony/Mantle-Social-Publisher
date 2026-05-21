@@ -7,6 +7,7 @@ import secrets
 import sqlite3
 import threading
 import os
+import re
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Dict, Any, Optional
