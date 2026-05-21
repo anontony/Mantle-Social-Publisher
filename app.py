@@ -871,10 +871,72 @@ a{{color:#ff8bd8;font-weight:800}}
 option{{background:#14121e;color:var(--text)}}
 ::placeholder{{color:#766985}}
 .help{{font-size:13px;color:var(--muted);margin-top:8px}}
-@media(max-width:920px){{.sidebar{{position:static;width:auto;min-height:auto;margin:14px;border-radius:26px}}.layout{{display:block}}.main{{margin-left:0;padding:20px}}.grid{{grid-template-columns:1fr}}.header{{display:block}}h1{{font-size:34px}}.status{{margin-top:16px}}}}
+
+.mobile-topbar{{display:none}}
+.mobile-overlay{{display:none}}
+.mobile-title{{font-size:15px;font-weight:950;letter-spacing:-.02em}}
+.mobile-menu-btn{{width:44px;min-height:44px;padding:0;border-radius:15px;font-size:20px}}
+.mobile-wallet{{font-size:12px;color:var(--muted);font-weight:900;max-width:112px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}}
+
+@media(max-width:920px){{
+  body{{background-attachment:fixed;padding-bottom:18px}}
+  .layout{{display:block;min-height:100vh}}
+  .mobile-topbar{{
+    display:flex;position:sticky;top:0;z-index:50;align-items:center;justify-content:space-between;gap:12px;
+    margin:0;padding:12px 14px;background:rgba(8,7,12,.84);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);
+    border-bottom:1px solid var(--line);box-shadow:0 12px 30px rgba(0,0,0,.24);
+  }}
+  .mobile-overlay{{
+    display:block;position:fixed;inset:0;z-index:58;background:rgba(0,0,0,.55);opacity:0;pointer-events:none;transition:opacity .18s ease;
+  }}
+  body.menu-open .mobile-overlay{{opacity:1;pointer-events:auto}}
+  .sidebar{{
+    position:fixed;z-index:60;top:10px;bottom:10px;left:10px;right:auto;width:min(86vw,330px);height:auto;
+    transform:translateX(calc(-100% - 22px));transition:transform .22s ease;margin:0;padding:22px 16px;border-radius:28px;overflow-y:auto;
+  }}
+  body.menu-open .sidebar{{transform:translateX(0)}}
+  .brand{{font-size:28px;text-align:left;margin-left:8px}}
+  .subbrand{{text-align:left;margin-left:8px;margin-bottom:16px}}
+  .nav-section{{margin-top:16px}}
+  .nav{{justify-content:flex-start;text-align:left;min-height:46px;margin:8px 0;border-radius:17px}}
+  .main{{margin-left:0;padding:18px 14px 22px;max-width:none;width:100%}}
+  .header{{display:block;margin-bottom:14px}}
+  .header>.status,.header>div:last-child{{display:none}}
+  h1{{font-size:32px;line-height:1.08;margin-top:4px}}
+  .desc{{font-size:14px;line-height:1.45}}
+  .card{{padding:18px;margin:14px 0;border-radius:24px}}
+  .card h2,.card h3{{font-size:19px;margin-bottom:14px}}
+  .grid{{display:block}}
+  .grid label{{display:block;margin:14px 0 7px;font-size:14px}}
+  input,textarea,select{{font-size:16px;padding:14px 15px;border-radius:15px}}
+  textarea{{min-height:124px}}
+  fieldset{{padding:14px;border-radius:22px;margin:12px 0}}
+  .actions{{display:grid;grid-template-columns:1fr;gap:10px;width:100%}}
+  button,.button{{width:100%;min-height:48px;padding:13px 16px}}
+  .checkrow{{display:grid;grid-template-columns:1fr;gap:9px}}
+  .checkrow label{{border-radius:16px;justify-content:flex-start}}
+  pre{{min-height:240px;max-height:360px;font-size:12px;padding:14px;border-radius:18px}}
+  .profile-grid,.workflow{{grid-template-columns:1fr!important}}
+  .metric,.step{{border-radius:20px}}
+  .secret-toggle{{width:40px;min-height:38px}}
+}}
+
+@media(max-width:420px){{
+  .main{{padding-left:10px;padding-right:10px}}
+  .mobile-topbar{{padding-left:10px;padding-right:10px}}
+  h1{{font-size:28px}}
+  .card{{padding:16px;border-radius:22px}}
+  .mobile-wallet{{max-width:92px}}
+}}
 </style>
 </head>
 <body>
+<div class="mobile-topbar">
+  <button class="mobile-menu-btn" type="button" id="mobileMenuBtn" aria-label="Open menu">☰</button>
+  <div class="mobile-title">Mantle Social Publisher</div>
+  <div class="mobile-wallet">{esc(short_addr(user.get("address", ""))) if user else "Guest"}</div>
+</div>
+<div class="mobile-overlay" id="mobileOverlay"></div>
 <div class="layout">
   <aside class="sidebar">
     <div class="brand">Mantle</div>
@@ -907,6 +969,13 @@ option{{background:#14121e;color:var(--text)}}
 
 <script>
 document.addEventListener('DOMContentLoaded', () => {{
+  const menuBtn = document.getElementById('mobileMenuBtn');
+  const overlay = document.getElementById('mobileOverlay');
+  const closeMenu = () => document.body.classList.remove('menu-open');
+  if (menuBtn) menuBtn.addEventListener('click', () => document.body.classList.toggle('menu-open'));
+  if (overlay) overlay.addEventListener('click', closeMenu);
+  document.querySelectorAll('.sidebar .nav').forEach((link) => link.addEventListener('click', closeMenu));
+
   document.querySelectorAll('.secret-toggle').forEach((button) => {{
     button.addEventListener('click', () => {{
       const targetId = button.getAttribute('data-target');

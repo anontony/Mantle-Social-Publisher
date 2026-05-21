@@ -325,3 +325,16 @@ The demo wallet skips this payment check and receives a full plan automatically.
 - [ ] Wallet payment tested on Mantle Mainnet
 - [ ] Credit Balance refresh tested
 - [ ] GitHub repository excludes runtime files and secrets
+
+## Mobile UX
+
+The dashboard includes a responsive mobile interface for phone users:
+
+- Sticky mobile top bar
+- Slide-in sidebar menu
+- Full-width touch-friendly buttons
+- Single-column forms
+- Larger mobile inputs to avoid iOS zoom
+- Mobile-friendly logs, profile cards, and Web3 wallet actions
+
+Open the app on a phone browser or in MetaMask mobile browser, then use the menu button in the top-left corner to switch between User Profile, RSS / WordPress, Social Posting, Telegram Forward, BlockScam, Login & Cookies, and System Logs.
