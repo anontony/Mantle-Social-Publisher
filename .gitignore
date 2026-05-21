@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.env
+.env.*
+runtime/
+/data/
+*.session
+*.session-journal
+*.sqlite
+*.db
+browser_profiles/
+playwright-report/
+.DS_Store
