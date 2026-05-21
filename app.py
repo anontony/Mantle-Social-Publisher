@@ -767,9 +767,10 @@ def page_shell(tab: str, title: str, content: str, message: str = "", user: Opti
   --shadow2:0 12px 30px rgba(255,0,122,.18);
 }}
 *{{box-sizing:border-box}}
-html{{scroll-behavior:smooth}}
+html{{scroll-behavior:smooth;overflow-x:hidden}}
 body{{
   margin:0;
+  overflow-x:hidden;
   font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;
   color:var(--text);
   background:
@@ -878,7 +879,7 @@ option{{background:#14121e;color:var(--text)}}
 .mobile-menu-btn{{width:44px;min-height:44px;padding:0;border-radius:15px;font-size:20px}}
 .mobile-wallet{{font-size:12px;color:var(--muted);font-weight:900;max-width:112px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}}
 
-@media(max-width:920px){{
+@media(max-width:1280px){{
   body{{background-attachment:fixed;padding-bottom:18px}}
   .layout{{display:block;min-height:100vh}}
   .mobile-topbar{{
@@ -891,7 +892,7 @@ option{{background:#14121e;color:var(--text)}}
   }}
   body.menu-open .mobile-overlay{{opacity:1;pointer-events:auto}}
   .sidebar{{
-    position:fixed;z-index:60;top:10px;bottom:10px;left:10px;right:auto;width:min(86vw,330px);height:auto;
+    position:fixed;z-index:60;top:10px;bottom:10px;left:10px;right:auto;width:min(88vw,320px);height:auto;
     transform:translateX(calc(-100% - 22px));transition:transform .22s ease;margin:0;padding:22px 16px;border-radius:28px;overflow-y:auto;
   }}
   body.menu-open .sidebar{{transform:translateX(0)}}
@@ -921,7 +922,7 @@ option{{background:#14121e;color:var(--text)}}
   .secret-toggle{{width:40px;min-height:38px}}
 }}
 
-@media(max-width:420px){{
+@media(max-width:560px){{
   .main{{padding-left:10px;padding-right:10px}}
   .mobile-topbar{{padding-left:10px;padding-right:10px}}
   h1{{font-size:28px}}
