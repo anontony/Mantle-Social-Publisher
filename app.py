@@ -35,6 +35,8 @@ from core import (
     CREDIT_TOKEN_SYMBOL,
     CONTENT_LANGUAGES,
     apply_server_subscription_settings,
+    set_log_context,
+    clear_log_context,
 )
 
 app = FastAPI(title=APP_NAME)
@@ -50,7 +52,24 @@ telegram_service = TelegramService(lambda: cfg)
 block_scam_service = BlockScamService(lambda: cfg, telegram_service)
 
 log_buffer: list[str] = []
+user_log_buffers: dict[str, list[str]] = {}
 MAX_LOGS = 500
+
+
+def append_limited(buf: list[str], msg: str) -> None:
+    buf.append(msg)
+    if len(buf) > MAX_LOGS:
+        del buf[: len(buf) - MAX_LOGS]
+
+
+def logs_for_user(user: Optional[dict], limit: int = MAX_LOGS) -> list[str]:
+    if not user or not user.get("address"):
+        return []
+    try:
+        key = normalize_address(user["address"]).lower()
+    except Exception:
+        return []
+    return user_log_buffers.get(key, [])[-limit:]
 
 
 # =========================================================
@@ -135,6 +154,19 @@ def app_config_from_dict(data: dict) -> AppConfig:
         return base
 
 
+def public_anonymous_config() -> AppConfig:
+    """Return a clean non-user config for signed-out visitors.
+
+    Never reuse the module-level cfg after a wallet disconnect, because it may
+    contain the last logged-in user's saved keys/cookies. Server-side Web3
+    settings are still applied from Railway ENV, but user credentials stay blank.
+    """
+    c = apply_server_subscription_settings(AppConfig())
+    if getattr(c, "content_language", "English") not in CONTENT_LANGUAGES:
+        c.content_language = "English"
+    return c
+
+
 def default_config_for_user(address: str) -> AppConfig:
     c = apply_server_subscription_settings(AppConfig())
     short = normalize_address(address)[:10].replace('0x', '')
@@ -163,7 +195,7 @@ def ensure_user_config(address: str) -> AppConfig:
 def load_config_for_user(user: Optional[dict]) -> AppConfig:
     if user and user.get("address"):
         return ensure_user_config(user["address"])
-    return cfg
+    return public_anonymous_config()
 
 
 def save_config_for_user(address: str, c: AppConfig) -> None:
@@ -653,12 +685,56 @@ def require_active_redirect(request: Request, tab: str = "profile") -> Optional[
 def drain_logs() -> None:
     while True:
         try:
-            msg = log_queue.get_nowait()
-            log_buffer.append(msg)
-            if len(log_buffer) > MAX_LOGS:
-                del log_buffer[: len(log_buffer) - MAX_LOGS]
+            item = log_queue.get_nowait()
+            if isinstance(item, dict):
+                msg = str(item.get("message") or "")
+                wallet = item.get("wallet")
+            else:
+                msg = str(item)
+                wallet = None
+
+            if not msg:
+                continue
+
+            if wallet:
+                key = normalize_address(str(wallet)).lower()
+                append_limited(user_log_buffers.setdefault(key, []), msg)
+            else:
+                append_limited(log_buffer, msg)
         except Exception:
             break
+
+
+def log_info_for_user(address: str, message: str) -> None:
+    token = set_log_context(normalize_address(address))
+    try:
+        logger.info(message)
+    finally:
+        clear_log_context(token)
+
+
+def log_error_for_user(address: str, message: str) -> None:
+    token = set_log_context(normalize_address(address))
+    try:
+        logger.error(message)
+    finally:
+        clear_log_context(token)
+
+
+def run_with_user_log_context(address: str, fn):
+    token = set_log_context(normalize_address(address))
+    try:
+        return fn()
+    finally:
+        clear_log_context(token)
+
+
+async def await_with_user_log_context(address: str, coro):
+    token = set_log_context(normalize_address(address))
+    try:
+        return await coro
+    finally:
+        clear_log_context(token)
 
 
 def set_cfg_field(name: str, value: Any) -> None:
@@ -798,10 +874,11 @@ async def publish_socials_for_state(summary: str, state: dict[str, Any]):
 
 def bot_worker_for_user(address: str, stop_evt: threading.Event):
     a = normalize_address(address)
+    token = set_log_context(a)
     state = get_user_services(a)
     next_wp_time = 0
-    runtime.submit(state["telegram"].forward_loop(stop_evt))
-    runtime.submit(state["block"].run_basic_monitor(stop_evt))
+    runtime.submit(await_with_user_log_context(a, state["telegram"].forward_loop(stop_evt)))
+    runtime.submit(await_with_user_log_context(a, state["block"].run_basic_monitor(stop_evt)))
 
     while not stop_evt.is_set():
         try:
@@ -812,7 +889,7 @@ def bot_worker_for_user(address: str, stop_evt: threading.Event):
             if now >= next_wp_time:
                 result = state["news"].create_and_post_once()
                 if result:
-                    fut = runtime.submit(publish_socials_for_state(result["summary"], state))
+                    fut = runtime.submit(await_with_user_log_context(a, publish_socials_for_state(result["summary"], state)))
                     try:
                         fut.result(timeout=300)
                     except Exception as e:
@@ -824,6 +901,7 @@ def bot_worker_for_user(address: str, stop_evt: threading.Event):
             time.sleep(5)
 
     logger.info(f"Bot stopped for {short_addr(a)}.")
+    clear_log_context(token)
 
 
 # =========================================================
@@ -880,7 +958,8 @@ def nav_item(tab: str, label: str, current: str) -> str:
 
 def page_shell(tab: str, title: str, content: str, message: str = "", user: Optional[dict] = None) -> str:
     drain_logs()
-    logs = html.escape("\n".join(log_buffer[-160:]))
+    visible_logs = logs_for_user(user, 160)
+    logs = html.escape("\n".join(visible_logs) if user else "Connect a wallet to view this workspace's private logs.")
     status = bot_status(user)
     status_class = "running" if status == "Running" else "stopped"
     msg_html = f'<div class="toast">{esc(message)}</div>' if message else ""
@@ -2076,12 +2155,15 @@ def blockscam_content() -> str:
 
 def log_content() -> str:
     drain_logs()
-    logs = html.escape("\n".join(log_buffer[-MAX_LOGS:]))
+    user = globals().get("_render_user_context")
+    raw = logs_for_user(user, MAX_LOGS) if user else []
+    logs = html.escape("\n".join(raw) if raw else ("No logs for this wallet yet." if user else "Connect a wallet to view private workspace logs."))
     return f"""
 <div class="card">
-  <h3>System Logs</h3>
+  <h3>Workspace Logs</h3>
+  <p class="help">Only logs generated by the connected wallet workspace are shown here.</p>
   <pre>{logs}</pre>
-  <p><a href="/logs" target="_blank">Open raw logs</a></p>
+  <p><a href="/logs" target="_blank">Open raw wallet logs</a></p>
 </div>
 """
 
@@ -2170,7 +2252,7 @@ async def web3_verify(request: Request):
         ensure_user_config(address)
         res = JSONResponse({"ok": True, "username": username, "address": address})
         res.set_cookie("msp_session", token, max_age=30 * 24 * 3600, **session_cookie_options())
-        logger.info(f"✅ Web3 wallet login: {username} {short_addr(address)}")
+        log_info_for_user(address, f"✅ Web3 wallet login: {username} {short_addr(address)}")
         return res
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -2185,12 +2267,16 @@ def web3_check_payment(request: Request):
     try:
         result = refresh_subscription(user["address"])
         if result.get("active"):
-            logger.info(f"✅ Subscription active for {short_addr(user['address'])}. Tx: {result.get('tx')}")
+            log_info_for_user(user['address'], f"✅ Subscription active for {short_addr(user['address'])}. Tx: {result.get('tx')}")
             return RedirectResponse("/?tab=profile&msg=paid", status_code=303)
-        logger.warning(f"No valid subscription payment found for {short_addr(user['address'])}.")
+        token = set_log_context(user['address'])
+        try:
+            logger.warning(f"No valid subscription payment found for {short_addr(user['address'])}.")
+        finally:
+            clear_log_context(token)
         return RedirectResponse("/?tab=profile&msg=nopayment", status_code=303)
     except Exception as e:
-        logger.error(f"Payment check error: {e}")
+        log_error_for_user(user['address'], f"Payment check error: {e}")
         return RedirectResponse("/?tab=profile&msg=nopayment", status_code=303)
 
 
@@ -2225,6 +2311,7 @@ def home(request: Request, tab: str = "home", msg: str = ""):
         "nopayment": "No valid monthly payment found yet.",
         "logout": "Wallet disconnected.",
         "subrequired": "Monthly subscription required before using this feature.",
+        "loginrequired": "Connect your wallet before saving workspace settings.",
     }
     message = message_map.get(msg, "")
     if tab == "profile":
@@ -2239,14 +2326,12 @@ async def save(request: Request, next: str = "home"):
     user = get_current_user(request)
     activate_config_for_user(user)
     form = await request.form()
+    if not user or not user.get("address"):
+        return RedirectResponse("/?tab=profile&msg=loginrequired", status_code=303)
     save_from_form(dict(form))
     apply_server_subscription_settings(cfg)
-    if user and user.get("address"):
-        save_config_for_user(user["address"], cfg)
-        logger.info(f"💾 Saved personal configuration for {short_addr(user['address'])}.")
-    else:
-        ConfigStore.save(cfg)
-        logger.info("💾 Saved global fallback configuration.")
+    save_config_for_user(user["address"], cfg)
+    log_info_for_user(user["address"], f"💾 Saved personal configuration for {short_addr(user['address'])}.")
     if next not in TAB_RENDERERS:
         next = "home"
     return RedirectResponse(f"/?tab={next}&msg=saved", status_code=303)
@@ -2259,13 +2344,13 @@ def start(request: Request):
     address = normalize_address(user["address"])
     state = user_bots.get(address)
     if state and state.get("thread") and state["thread"].is_alive():
-        logger.info(f"Bot is already running for {short_addr(address)}.")
+        log_info_for_user(address, f"Bot is already running for {short_addr(address)}.")
     else:
         stop_evt = threading.Event()
         thread = threading.Thread(target=bot_worker_for_user, args=(address, stop_evt), daemon=True)
         user_bots[address] = {"thread": thread, "stop_event": stop_evt}
         thread.start()
-        logger.info(f"🚀 Bot started for {short_addr(address)}.")
+        log_info_for_user(address, f"🚀 Bot started for {short_addr(address)}.")
     return RedirectResponse("/?tab=home", status_code=303)
 
 
@@ -2277,7 +2362,7 @@ def stop(request: Request):
     state = user_bots.get(address)
     if state:
         state["stop_event"].set()
-    logger.info(f"🛑 Stopping bot for {short_addr(address)}...")
+    log_info_for_user(address, f"🛑 Stopping bot for {short_addr(address)}...")
     return RedirectResponse("/?tab=home", status_code=303)
 
 
@@ -2288,6 +2373,7 @@ def scan(request: Request):
     address = normalize_address(user["address"])
     state = get_user_services(address)
     def worker():
+        token = set_log_context(address)
         try:
             candidates = state["news"].fetch_candidates()
             logger.info(f"🔎 Found {len(candidates)} matching news items for {short_addr(address)}.")
@@ -2295,6 +2381,8 @@ def scan(request: Request):
                 logger.info(f"- {n.get('title')}")
         except Exception as e:
             logger.error(f"Scan RSS error: {e}")
+        finally:
+            clear_log_context(token)
 
     threading.Thread(target=worker, daemon=True).start()
     return RedirectResponse("/?tab=wordpress", status_code=303)
@@ -2307,13 +2395,16 @@ def post_once(request: Request):
     address = normalize_address(user["address"])
     state = get_user_services(address)
     def worker():
+        token = set_log_context(address)
         try:
             result = state["news"].create_and_post_once()
             if result:
-                fut = runtime.submit(publish_socials_for_state(result["summary"], state))
+                fut = runtime.submit(await_with_user_log_context(address, publish_socials_for_state(result["summary"], state)))
                 fut.result(timeout=300)
         except Exception as e:
             logger.error(f"Post once error: {e}")
+        finally:
+            clear_log_context(token)
 
     threading.Thread(target=worker, daemon=True).start()
     return RedirectResponse("/?tab=home", status_code=303)
@@ -2330,7 +2421,7 @@ def telegram_send_code(request: Request):
         if not phone:
             logger.error("Missing Telegram phone number.")
         else:
-            runtime.submit(state["telegram"].send_login_code(phone))
+            runtime.submit(await_with_user_log_context(address, state["telegram"].send_login_code(phone)))
     except Exception as e:
         logger.error(f"Telegram send code error: {e}")
     return RedirectResponse("/?tab=login", status_code=303)
@@ -2342,7 +2433,7 @@ def telegram_confirm(request: Request, code: str = Form(...), password: str = Fo
     if guard: return guard
     try:
         state = get_user_services(user["address"])
-        runtime.submit(state["telegram"].confirm_login_code(code.strip(), password.strip()))
+        runtime.submit(await_with_user_log_context(user["address"], state["telegram"].confirm_login_code(code.strip(), password.strip())))
     except Exception as e:
         logger.error(f"Telegram confirm error: {e}")
     return RedirectResponse("/?tab=login", status_code=303)
@@ -2354,7 +2445,7 @@ def telegram_test(request: Request):
     if guard: return guard
     try:
         state = get_user_services(user["address"])
-        runtime.submit(state["telegram"].test_session())
+        runtime.submit(await_with_user_log_context(user["address"], state["telegram"].test_session()))
     except Exception as e:
         logger.error(f"Telegram test error: {e}")
     return RedirectResponse("/?tab=login", status_code=303)
@@ -2366,16 +2457,18 @@ def test_x(request: Request):
     if guard: return guard
     state = get_user_services(user["address"])
     def worker():
+        token = set_log_context(user["address"])
         c = state["holder"]["cfg"]
         old = c.enable_x_post
         try:
             c.enable_x_post = True
-            fut = runtime.submit(state["social"].post_x("Automated test post from Mantle Social Publisher on Railway."))
+            fut = runtime.submit(await_with_user_log_context(user["address"], state["social"].post_x("Automated test post from Mantle Social Publisher on Railway.")))
             fut.result(timeout=180)
         except Exception as e:
             logger.error(f"Test X error: {e}")
         finally:
             c.enable_x_post = old
+            clear_log_context(token)
 
     threading.Thread(target=worker, daemon=True).start()
     return RedirectResponse("/?tab=login", status_code=303)
@@ -2387,25 +2480,30 @@ def test_facebook(request: Request):
     if guard: return guard
     state = get_user_services(user["address"])
     def worker():
+        token = set_log_context(user["address"])
         c = state["holder"]["cfg"]
         old = c.enable_facebook_post
         try:
             c.enable_facebook_post = True
-            fut = runtime.submit(state["social"].post_facebook("Automated test post from Mantle Social Publisher on Railway."))
+            fut = runtime.submit(await_with_user_log_context(user["address"], state["social"].post_facebook("Automated test post from Mantle Social Publisher on Railway.")))
             fut.result(timeout=240)
         except Exception as e:
             logger.error(f"Test Facebook error: {e}")
         finally:
             c.enable_facebook_post = old
+            clear_log_context(token)
 
     threading.Thread(target=worker, daemon=True).start()
     return RedirectResponse("/?tab=login", status_code=303)
 
 
 @app.get("/logs", response_class=PlainTextResponse)
-def logs():
+def logs(request: Request):
     drain_logs()
-    return "\n".join(log_buffer[-MAX_LOGS:])
+    user = get_current_user(request)
+    if not user:
+        return "Connect a wallet to view private workspace logs."
+    return "\n".join(logs_for_user(user, MAX_LOGS))
 
 
 @app.get("/health", response_class=PlainTextResponse)

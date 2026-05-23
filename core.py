@@ -12,6 +12,7 @@ import sqlite3
 import asyncio
 import logging
 import threading
+from contextvars import ContextVar
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
@@ -107,6 +108,24 @@ CATEGORY_KEYWORDS = {
 # LOG TO UI
 # =========================================================
 
+_LOG_WALLET_CONTEXT: ContextVar[str | None] = ContextVar("log_wallet_context", default=None)
+
+def set_log_context(wallet_address: str | None):
+    value = (wallet_address or "").lower() or None
+    return _LOG_WALLET_CONTEXT.set(value)
+
+def clear_log_context(token=None) -> None:
+    try:
+        if token is not None:
+            _LOG_WALLET_CONTEXT.reset(token)
+        else:
+            _LOG_WALLET_CONTEXT.set(None)
+    except Exception:
+        _LOG_WALLET_CONTEXT.set(None)
+
+def get_log_context() -> str | None:
+    return _LOG_WALLET_CONTEXT.get()
+
 class QueueLogHandler(logging.Handler):
     def __init__(self, q: queue.Queue):
         super().__init__()
@@ -115,7 +134,7 @@ class QueueLogHandler(logging.Handler):
     def emit(self, record):
         try:
             msg = self.format(record)
-            self.q.put(msg)
+            self.q.put({"wallet": get_log_context(), "message": msg})
         except Exception:
             pass
 
