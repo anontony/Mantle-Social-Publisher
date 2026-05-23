@@ -36,6 +36,7 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 APP_NAME = "Mantle Social Publisher"
 PROJECT_OWNER_WALLET = "0x152B5F1E58ACD5036D8d2027D3B793e81103E644"
 PROJECT_DEMO_WALLETS = {PROJECT_OWNER_WALLET.lower()}
+CREDIT_TOKEN_SYMBOL = "MFC"
 CONTENT_LANGUAGES = ["English", "Vietnamese", "Indonesian", "Thai", "Chinese", "Korean", "Japanese", "Spanish", "French", "Portuguese", "Hindi"]
 
 def base_dir() -> Path:
@@ -160,7 +161,7 @@ class AppConfig:
     # Default setup is optimized for low API cost: heuristic scoring, one text call per article, and low-quality image generation only for high-score news.
     ai_text_model: str = "gpt-5-nano"
     enable_ai_scoring: bool = False
-    image_policy: str = "high_score_only"  # off | high_score_only | every_post
+    image_policy: str = "every_post"  # off | high_score_only | every_post
     image_min_score: int = 9
     image_model: str = "gpt-image-2"
     image_quality: str = "low"
@@ -196,6 +197,8 @@ class AppConfig:
     mantlescan_api_key: str = ""
     monthly_mnt_amount: float = 50.0
     monthly_credit_amount: int = 100
+    credit_token_address: str = ""
+    credit_token_symbol: str = CREDIT_TOKEN_SYMBOL
 
     enable_block_scam: bool = False
     enable_block_scam_ai: bool = True
@@ -229,6 +232,8 @@ def apply_server_subscription_settings(cfg: AppConfig) -> AppConfig:
     cfg.mantle_rpc_url = os.getenv("MANTLE_RPC_URL", cfg.mantle_rpc_url).strip() or "https://rpc.mantle.xyz"
     cfg.mantlescan_api_url = os.getenv("EXPLORER_API_V2_URL", os.getenv("ETHERSCAN_API_URL", cfg.mantlescan_api_url)).strip() or "https://api.etherscan.io/v2/api"
     cfg.mantlescan_api_key = os.getenv("ETHERSCAN_API_KEY", os.getenv("MANTLESCAN_API_KEY", cfg.mantlescan_api_key)).strip()
+    cfg.credit_token_address = os.getenv("CREDIT_TOKEN_ADDRESS", cfg.credit_token_address).strip()
+    cfg.credit_token_symbol = os.getenv("CREDIT_TOKEN_SYMBOL", cfg.credit_token_symbol or CREDIT_TOKEN_SYMBOL).strip() or CREDIT_TOKEN_SYMBOL
     try:
         cfg.monthly_mnt_amount = float(os.getenv("MONTHLY_MNT_AMOUNT", str(cfg.monthly_mnt_amount)).strip())
     except Exception:
@@ -576,6 +581,66 @@ CONTENT:
             logger.warning(f"Score error, falling back to local scoring: {e}")
             return self.score_news_heuristic(news)
 
+    def _article_quality_ok(self, article_html: str) -> bool:
+        """Keep WordPress articles from becoming short summaries."""
+        plain = strip_html(article_html)
+        word_count = len(re.findall(r"\w+", plain))
+        h2_count = len(re.findall(r"<h2[\s>].*?</h2>|<h2>", article_html or "", flags=re.I | re.S))
+        paragraphs = len(re.findall(r"<p[\s>].*?</p>", article_html or "", flags=re.I | re.S))
+        return word_count >= 750 and h2_count >= 4 and paragraphs >= 8
+
+    def _repair_article_if_needed(self, news: Dict[str, Any], title: str, article_html: str) -> str:
+        """Retry once with a stronger prompt/model when the low-cost model returns a thin article."""
+        if self._article_quality_ok(article_html):
+            return article_html
+
+        logger.warning("Article quality check failed; regenerating a fuller WordPress article.")
+        cfg = self.cfg_getter()
+        client = self.get_openai()
+        fallback_model = "gpt-5-mini" if getattr(cfg, "ai_text_model", "gpt-5-nano") == "gpt-5-nano" else getattr(cfg, "ai_text_model", "gpt-5-mini")
+        source = strip_html(self.get_full_content(news))[:7000]
+
+        prompt = f"""
+You are a senior financial journalist and WordPress editor.
+
+{self.language_rule()}
+
+Write a COMPLETE WordPress article for the headline below.
+
+STRICT OUTPUT RULES:
+- Return HTML only. No markdown. No JSON. No code block.
+- Do NOT use <h1>; WordPress already uses the post title as H1.
+- Start with 2 strong introductory <p> paragraphs.
+- Use at least 5 meaningful <h2> sections.
+- Use <h3> only when it helps explain a sub-topic.
+- Each <h2> section must have 2-3 substantial paragraphs.
+- Write like a real financial news article, not a summary.
+- Do not use bullet points unless absolutely necessary.
+- Do not fabricate numbers, quotes, dates, or facts not present in the source.
+- If the source is short, explain the context, market reaction, investor implications, and what to watch next without inventing data.
+- Target length: 900-1,300 words.
+
+TITLE:
+{title}
+
+SOURCE:
+{source}
+"""
+        try:
+            res = client.chat.completions.create(
+                model=fallback_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=4200,
+            )
+            repaired = clean_ai_output(res.choices[0].message.content or "")
+            if self._article_quality_ok(repaired):
+                return repaired
+            logger.warning("Article repair still looks thin; using the best available article.")
+            return repaired or article_html
+        except Exception as e:
+            logger.error(f"Article repair error: {e}")
+            return article_html
+
     def make_content_bundle(self, news: Dict[str, Any], link_placeholder: str = "{{LINK}}") -> Dict[str, str]:
         """Generate title, WordPress article, and social summary in one API call to reduce cost."""
         cfg = self.cfg_getter()
@@ -584,14 +649,25 @@ CONTENT:
         content = strip_html(self.get_full_content(news))[:5000]
 
         prompt = f"""
-You are a financial news editor and journalist.
+You are a senior financial news editor and WordPress journalist.
 
 {self.language_rule()}
 
 Create a JSON object with exactly these keys:
 - "title": one natural financial-news headline.
-- "article_html": a WordPress article using HTML <h2> and optional <h3>. Do not use <h1>. Write natural paragraphs, not bullets. Do not add outside facts or fabricate numbers. Length: about 550-800 words.
+- "article_html": a complete WordPress article in HTML.
 - "social_summary": a concise social post, 500-900 characters, with one market-impact sentence and this link placeholder at the end: {link_placeholder}
+
+ARTICLE_HTML REQUIREMENTS:
+- Do NOT use <h1>; WordPress already uses the post title as H1.
+- Start with 2 strong introductory <p> paragraphs.
+- Use at least 5 meaningful <h2> sections.
+- Use <h3> only when it helps explain a sub-topic.
+- Each major section must include substantial paragraphs, not one-line summaries.
+- Write like a real financial article with context, market impact, investor implications, and what to watch next.
+- Do not use bullets unless truly necessary.
+- Do not add outside facts, fake quotes, fake dates, or fabricated numbers.
+- Target length: 900-1,300 words.
 
 SOURCE TITLE:
 {news.get("title")}
@@ -604,7 +680,7 @@ SOURCE CONTENT:
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
-                max_completion_tokens=2500,
+                max_completion_tokens=4200,
             )
             raw = clean_ai_output(res.choices[0].message.content or "{}")
             data = json.loads(raw)
@@ -612,7 +688,8 @@ SOURCE CONTENT:
             article = clean_ai_output(str(data.get("article_html") or ""))
             summary = clean_ai_output(str(data.get("social_summary") or ""))
             if not article:
-                article = f"<h2>{title}</h2><p>{content[:1200]}</p>"
+                article = f"<p>{content[:700]}</p><h2>Market Context</h2><p>{content[700:1400]}</p>"
+            article = self._repair_article_if_needed(news, title, article)
             if not summary:
                 summary = f"{title}\n\n{strip_html(article)[:650]}...\n\n{link_placeholder}"
             return {"title": title, "article": article, "summary": summary}
@@ -657,8 +734,10 @@ You are a financial journalist.
 
 {self.language_rule()}
 
-Write a natural financial-news article with HTML H2/H3 structure.
-Do not use H1. Write coherent paragraphs, not bullets. Do not add outside facts or fabricate numbers. Length: 550-800 words.
+Write a complete natural financial-news article with HTML H2/H3 structure.
+Do not use H1 because WordPress already uses the post title as H1.
+Start with 2 introductory paragraphs, use at least 5 <h2> sections, and make every section substantial.
+Write coherent paragraphs, not bullets. Do not add outside facts or fabricate numbers. Target length: 900-1,300 words.
 
 SOURCE DATA:
 {news.get("title")}
@@ -668,9 +747,9 @@ SOURCE DATA:
         res = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            max_completion_tokens=1800,
+            max_completion_tokens=4200,
         )
-        return clean_ai_output(res.choices[0].message.content)
+        return self._repair_article_if_needed(news, news.get("title", "Market Update"), clean_ai_output(res.choices[0].message.content))
 
     def should_generate_image(self, score: int) -> bool:
         cfg = self.cfg_getter()
@@ -695,10 +774,18 @@ SOURCE DATA:
         size = getattr(cfg, "image_size", "1536x1024") or "1536x1024"
 
         prompt = f"""
-Professional financial-news featured image for this headline:
+Create a clear, high-contrast editorial featured image for a financial news article.
+
+Headline:
 {title}
 
-No people, no faces, no hands, no logos, no watermark, no text. Use abstract financial markets, charts, market motion, crypto/finance symbols, and a polished editorial style.
+Visual direction:
+- 16:9 news-thumbnail composition.
+- Abstract financial markets, crypto market charts, candlestick motion, macro finance symbols, data grids, risk/volatility mood.
+- Strong foreground subject, clean depth, premium fintech editorial style.
+- No real people, no faces, no hands.
+- No readable text, no logos, no watermark, no brand names.
+- Must not be blank, plain, or mostly empty.
 """
         try:
             res = client.images.generate(
@@ -710,9 +797,13 @@ No people, no faces, no hands, no logos, no watermark, no text. Use abstract fin
             )
             img = res.data[0]
             if getattr(img, "url", None):
-                return requests.get(img.url, timeout=60).content
+                data = requests.get(img.url, timeout=60).content
+                logger.info(f"✅ Image generated: {len(data)} bytes")
+                return data
             if getattr(img, "b64_json", None):
-                return base64.b64decode(img.b64_json)
+                data = base64.b64decode(img.b64_json)
+                logger.info(f"✅ Image generated: {len(data)} bytes")
+                return data
         except Exception as e:
             logger.error(f"🔥 Image generation error: {e}")
         return None
@@ -735,12 +826,14 @@ No people, no faces, no hands, no logos, no watermark, no text. Use abstract fin
             r = requests.post(
                 media_url,
                 headers={"Authorization": f"Bearer {wp_jwt}"},
-                files={"file": ("img.jpg", img, "image/jpeg")},
+                files={"file": ("featured.png", img, "image/png")},
                 timeout=90
             )
 
             if r.status_code in (200, 201):
-                return r.json().get("id")
+                media_id = r.json().get("id")
+                logger.info(f"✅ Featured image uploaded: media_id={media_id}")
+                return media_id
 
             logger.error(f"Image upload error: {r.text}")
             return None
@@ -777,7 +870,7 @@ No people, no faces, no hands, no logos, no watermark, no text. Use abstract fin
             )
 
             if r.status_code in (200, 201):
-                logger.info("✅ WordPress POST OK")
+                logger.info(f"✅ WordPress POST OK | featured_media={img_id or 'none'}")
                 self.last_post_time = time.time()
                 return r.json()
 
@@ -816,7 +909,7 @@ LINK:
                 messages=[{"role": "user", "content": prompt}],
                 max_completion_tokens=400,
             )
-            return clean_ai_output(res.choices[0].message.content)
+            return self._repair_article_if_needed(news, news.get("title", "Market Update"), clean_ai_output(res.choices[0].message.content))
         except Exception as e:
             logger.error(f"Social summary error: {e}")
             return f"{title}\n\n{plain[:500]}...\n\n{link}"

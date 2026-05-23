@@ -11,3 +11,8 @@ runtime/
 browser_profiles/
 playwright-report/
 .DS_Store
+node_modules/
+artifacts/
+cache/
+coverage/
+typechain-types/

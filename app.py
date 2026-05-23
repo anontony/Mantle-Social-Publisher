@@ -32,6 +32,7 @@ from core import (
     DB_PATH,
     PROJECT_OWNER_WALLET,
     PROJECT_DEMO_WALLETS,
+    CREDIT_TOKEN_SYMBOL,
     CONTENT_LANGUAGES,
     apply_server_subscription_settings,
 )
@@ -377,6 +378,28 @@ def mnt_to_wei(amount: float | str) -> int:
     return int(Decimal(str(amount)) * Decimal(10) ** 18)
 
 
+def credit_to_units(amount: int | float | str) -> int:
+    return int(Decimal(str(amount)) * Decimal(10) ** 18)
+
+
+def zero_address() -> str:
+    return "0x0000000000000000000000000000000000000000"
+
+
+def configured_credit_token() -> str:
+    token = (getattr(cfg, "credit_token_address", "") or os.getenv("CREDIT_TOKEN_ADDRESS", "")).strip()
+    if token and token.startswith("0x") and len(token) == 42:
+        return token.lower()
+    return ""
+
+
+def short_optional_addr(address: str) -> str:
+    try:
+        return short_addr(address)
+    except Exception:
+        return "Not configured"
+
+
 def short_addr(address: str) -> str:
     a = normalize_address(address)
     return f"{a[:6]}...{a[-4:]}"
@@ -431,6 +454,94 @@ def _call_explorer_txlist(api_url: str, address: str) -> list[dict]:
         raise RuntimeError("DEPRECATED_V1_ENDPOINT")
 
     raise RuntimeError(f"Explorer API did not return a transaction list: {result_text or message or data}")
+
+
+def _call_explorer_token_transfers(api_url: str, address: str, token_address: str) -> list[dict]:
+    params = {
+        "chainid": int(os.getenv("EXPLORER_CHAIN_ID", "5000")),
+        "module": "account",
+        "action": "tokentx",
+        "address": normalize_address(address),
+        "contractaddress": normalize_address(token_address),
+        "startblock": 0,
+        "endblock": 999999999,
+        "page": 1,
+        "offset": 100,
+        "sort": "desc",
+    }
+    api_key = (cfg.mantlescan_api_key or os.getenv("ETHERSCAN_API_KEY") or os.getenv("MANTLESCAN_API_KEY") or "").strip()
+    if api_key:
+        params["apikey"] = api_key
+    r = __import__("requests").get(api_url, params=params, timeout=30)
+    data = r.json()
+    result = data.get("result")
+    if isinstance(result, list):
+        return result
+    message = str(data.get("message") or "")
+    result_text = str(result or "")
+    if "deprecated V1 endpoint" in result_text or "deprecated V1 endpoint" in message:
+        raise RuntimeError("DEPRECATED_V1_ENDPOINT")
+    raise RuntimeError(f"Explorer API did not return a token transfer list: {result_text or message or data}")
+
+
+def fetch_credit_token_purchases(address: str) -> list[dict]:
+    """Find monthly credit-token mints from the MantleFlowCredit contract.
+
+    The token contract mints 100 credit tokens to the buyer when they buy the
+    monthly plan. This checks ERC-20 Transfer events from the zero address to
+    the user, scoped to CREDIT_TOKEN_ADDRESS, then uses the mint time as the
+    subscription start time.
+    """
+    token = configured_credit_token()
+    if not token:
+        raise RuntimeError("CREDIT_TOKEN_ADDRESS is not configured. Deploy the credit token contract and add its address to Railway Variables.")
+
+    transfers: list[dict] | None = None
+    last_error: Exception | None = None
+    for api_url in _explorer_api_candidates():
+        try:
+            transfers = _call_explorer_token_transfers(api_url, address, token)
+            if "etherscan.io/v2" in api_url:
+                logger.info("✅ Credit token check using Etherscan API V2 with chainid=5000.")
+            else:
+                logger.info(f"✅ Credit token check using explorer API: {api_url}")
+            break
+        except Exception as e:
+            last_error = e
+            if str(e) == "DEPRECATED_V1_ENDPOINT":
+                logger.warning(f"Explorer token endpoint is deprecated, retrying Etherscan API V2: {api_url}")
+                continue
+            logger.warning(f"Explorer token request failed: {api_url} | {e}")
+            continue
+
+    if transfers is None:
+        raise RuntimeError(f"Credit token check failed. Last explorer error: {last_error}")
+
+    required = credit_to_units(cfg.monthly_credit_amount)
+    user_addr = normalize_address(address).lower()
+    purchases = []
+    for tx in transfers:
+        try:
+            if str(tx.get("contractAddress", "")).lower() != token:
+                continue
+            if str(tx.get("from", "")).lower() != zero_address():
+                continue
+            if str(tx.get("to", "")).lower() != user_addr:
+                continue
+            value = int(str(tx.get("value") or "0"))
+            if value < required:
+                continue
+            ts = int(str(tx.get("timeStamp") or "0"))
+            paid_at = datetime.fromtimestamp(ts, timezone.utc) if ts else datetime.now(timezone.utc)
+            purchases.append({
+                "hash": tx.get("hash") or tx.get("transactionHash") or "",
+                "value": value,
+                "paid_at": paid_at,
+                "token": token,
+            })
+        except Exception:
+            continue
+    return purchases
 
 
 def fetch_mantle_payments(address: str) -> list[dict]:
@@ -488,6 +599,27 @@ def refresh_subscription(address: str) -> dict:
     if is_demo_wallet(a):
         grant_demo_subscription(a)
         return {"active": True, "expires_at": (datetime.now(timezone.utc) + timedelta(days=subscription_days())).isoformat(), "tx": "demo-access", "demo": True}
+
+    token = configured_credit_token()
+    if token:
+        purchases = fetch_credit_token_purchases(a)
+        if not purchases:
+            return {"active": False, "message": "No valid MantleFlow Credit token mint found for this wallet."}
+        latest = max(purchases, key=lambda x: x["paid_at"])
+        expires = latest["paid_at"] + timedelta(days=subscription_days())
+        with auth_conn() as conn:
+            conn.execute(
+                """
+                UPDATE web3_users
+                SET subscription_expires_at=?, last_payment_tx=?, last_payment_amount_wei=?, last_payment_at=?
+                WHERE lower(address)=lower(?)
+                """,
+                (expires.isoformat(), latest["hash"], str(latest["value"]), latest["paid_at"].isoformat(), a),
+            )
+            conn.commit()
+        return {"active": expires > datetime.now(timezone.utc), "expires_at": expires.isoformat(), "tx": latest["hash"], "token": token}
+
+    # Backward-compatible fallback for older demos that paid MNT directly to the treasury.
     payments = fetch_mantle_payments(a)
     if not payments:
         return {"active": False, "message": "No valid monthly payment found on Mantle Mainnet."}
@@ -1170,6 +1302,8 @@ document.addEventListener('DOMContentLoaded', () => {{
 
 def profile_content(user: Optional[dict]) -> str:
     owner = PROJECT_OWNER_WALLET
+    credit_token = configured_credit_token()
+    token_symbol = getattr(cfg, "credit_token_symbol", CREDIT_TOKEN_SYMBOL) or CREDIT_TOKEN_SYMBOL
     amount_wei = str(mnt_to_wei(cfg.monthly_mnt_amount))
     active = user_is_active(user)
     is_demo = is_demo_wallet(user.get("address") if user else None)
@@ -1184,7 +1318,7 @@ def profile_content(user: Optional[dict]) -> str:
 
     if connected:
         access_title = "Demo access active" if is_demo else ("Full access unlocked" if active else "Subscription required")
-        access_note = "This demo wallet includes the full monthly plan for project review." if is_demo else ("Your monthly access is active. Credit Balance decays from 100% to 0% over the monthly period." if active else "Pay the monthly Mantle plan, then refresh your Credit Balance to unlock all app features.")
+        access_note = "This demo wallet includes the full monthly plan for project review." if is_demo else ("Your monthly access is active. Credit Balance decays from 100% to 0% over the monthly period." if active else "Buy the monthly credit token package, then refresh your Credit Balance to unlock all app features.")
         connect_action = f"""
         <div class="wallet-connected-card">
           <div>
@@ -1211,8 +1345,8 @@ def profile_content(user: Optional[dict]) -> str:
         </div>
         """
 
-    pay_disabled = "disabled" if (not connected or active) else ""
-    pay_label = "Demo Active" if is_demo else ("Plan Active" if active else "Pay with Wallet")
+    pay_disabled = "disabled" if (not connected or active or not credit_token) else ""
+    pay_label = "Demo Active" if is_demo else ("Plan Active" if active else "Buy Credit Tokens")
     status_badge = "Demo" if is_demo else ("Active" if active else ("Connected" if connected else "Guest"))
     status_class = "ok" if active else ("warn" if connected else "bad")
 
@@ -1409,7 +1543,7 @@ button[disabled]{{opacity:.45;cursor:not-allowed;transform:none!important;filter
     <p>{esc(access_note)}</p>
     <div class="credit-balance"><b>{credit}</b><span>Credits left · {credit_percent}%</span></div>
     <div class="credit-bar"><i></i></div>
-    <p class="help">Monthly plan: {esc(cfg.monthly_credit_amount)} Credits for {esc(cfg.monthly_mnt_amount)} MNT on Mantle Mainnet. Credits decrease daily according to the remaining time and reach 0 when the {subscription_days()}-day plan expires. Days left: {days_left}.</p>
+    <p class="help">Monthly plan: {esc(cfg.monthly_credit_amount)} {esc(token_symbol)} Credits for {esc(cfg.monthly_mnt_amount)} MNT on Mantle Mainnet. Tokens are minted to your wallet, while the app displays a time-decaying Credit Balance until the {subscription_days()}-day plan expires. Days left: {days_left}.</p>
   </div>
   {connect_action}
 </div>
@@ -1417,24 +1551,25 @@ button[disabled]{{opacity:.45;cursor:not-allowed;transform:none!important;filter
 <div class="card">
   <h3>Access Plan</h3>
   <div class="profile-grid">
-    <div class="metric"><span>Monthly Credits</span><b>{esc(cfg.monthly_credit_amount)} Credits</b></div>
+    <div class="metric"><span>Monthly Credits</span><b>{esc(cfg.monthly_credit_amount)} {esc(token_symbol)}</b></div>
     <div class="metric"><span>Plan Price</span><b>{esc(cfg.monthly_mnt_amount)} MNT</b></div>
-    <div class="metric"><span>Network</span><b>Mantle Mainnet</b></div>
-    <div class="metric"><span>Chain ID</span><b>5000</b></div>
+    <div class="metric"><span>Credit Token</span><b>{esc(short_optional_addr(credit_token))}</b></div>
+    <div class="metric"><span>Network</span><b>Mantle Mainnet · 5000</b></div>
   </div>
   <div class="actions">
     <button class="primary" id="payWithWalletBtn" type="button" {pay_disabled}>{pay_label}</button>
     <form method="post" action="/web3/check-payment"><button type="submit" {'disabled' if not connected else ''}>Refresh Credit Balance</button></form>
   </div>
-  <p class="help">Project owner wallet: <b>{esc(owner)}</b></p>
+  <p class="help">Credit token contract: <b>{esc(credit_token or "Not configured")}</b></p>
+  <p class="help">Treasury wallet: <b>{esc(owner)}</b></p>
 </div>
 
 <div class="card">
   <h3>How access works</h3>
   <div class="workflow">
     <div class="step"><strong>1</strong><h4>Connect wallet</h4><p>Use an EVM wallet such as MetaMask, Rabby, or Coinbase Wallet.</p></div>
-    <div class="step"><strong>2</strong><h4>Pay monthly plan</h4><p>Send {esc(cfg.monthly_mnt_amount)} MNT to the fixed project owner wallet.</p></div>
-    <div class="step"><strong>3</strong><h4>Verify on-chain</h4><p>The app checks Mantle Mainnet history for a valid payment transaction.</p></div>
+    <div class="step"><strong>2</strong><h4>Buy credit tokens</h4><p>Send {esc(cfg.monthly_mnt_amount)} MNT to the MantleFlow Credit contract.</p></div>
+    <div class="step"><strong>3</strong><h4>Verify token mint</h4><p>The app checks Mantle Mainnet for {esc(token_symbol)} tokens minted to your wallet.</p></div>
     <div class="step"><strong>4</strong><h4>Unlock automation</h4><p>Active users get {subscription_days()} days of access. Credits start at {esc(cfg.monthly_credit_amount)} and decrease daily.</p></div>
   </div>
 </div>
@@ -1444,7 +1579,8 @@ button[disabled]{{opacity:.45;cursor:not-allowed;transform:none!important;filter
   <div class="account-table">
     <div>Username</div><div>{esc(username)}</div>
     <div>Wallet</div><div>{esc(wallet)}</div>
-    <div>Credit Balance</div><div>{credit} / {esc(cfg.monthly_credit_amount)} Credits ({credit_percent}%)</div>
+    <div>Credit Balance</div><div>{credit} / {esc(cfg.monthly_credit_amount)} {esc(token_symbol)} Credits ({credit_percent}%)</div>
+    <div>Credit Token</div><div>{esc(credit_token or "Not configured")}</div>
     <div>Days Remaining</div><div>{days_left} days</div>
     <div>Subscription Expiry</div><div>{esc(exp)}</div>
     <div>Last Payment Tx</div><div>{esc(tx)}</div>
@@ -1455,6 +1591,7 @@ button[disabled]{{opacity:.45;cursor:not-allowed;transform:none!important;filter
 const MANTLE_CHAIN_ID_HEX = '0x1388';
 const MANTLE_RPC_URL = {json.dumps(cfg.mantle_rpc_url or 'https://rpc.mantle.xyz')};
 const OWNER_WALLET = {json.dumps(owner)};
+const CREDIT_TOKEN_ADDRESS = {json.dumps(credit_token)};
 const MONTHLY_AMOUNT_WEI = BigInt({json.dumps(amount_wei)});
 
 let ACTIVE_PROVIDER = null;
@@ -1629,7 +1766,7 @@ async function connectWallet() {{
 async function payWithWallet() {{
   const btn = document.getElementById('payWithWalletBtn');
   try {{
-    if (!OWNER_WALLET) throw new Error('Project owner wallet is missing in the app build.');
+    if (!CREDIT_TOKEN_ADDRESS) throw new Error('Credit token contract is not configured. Add CREDIT_TOKEN_ADDRESS in Railway Variables after deploying the token.');
     if (btn) btn.disabled = true;
     collectInjectedProviders();
     const provider = getEthereumProvider();
@@ -1640,15 +1777,15 @@ async function payWithWallet() {{
     const from = accounts[0];
     const txHash = await walletRequest('eth_sendTransaction', [{{
       from,
-      to: OWNER_WALLET,
+      to: CREDIT_TOKEN_ADDRESS,
       value: '0x' + MONTHLY_AMOUNT_WEI.toString(16)
     }}], provider);
-    alert('Payment submitted: ' + txHash + '\\nWait for confirmation, then click Refresh Credit Balance.');
+    alert('Credit token purchase submitted: ' + txHash + '\\nWait for confirmation, then click Refresh Credit Balance.');
   }} catch (e) {{
     const msg = (e && e.message) ? e.message : String(e);
     alert(msg);
   }} finally {{
-    if (btn && OWNER_WALLET) btn.disabled = false;
+    if (btn && CREDIT_TOKEN_ADDRESS) btn.disabled = false;
   }}
 }}
 

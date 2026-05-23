@@ -338,3 +338,106 @@ The dashboard includes a responsive mobile interface for phone users:
 - Mobile-friendly logs, profile cards, and Web3 wallet actions
 
 Open the app on a phone browser or in MetaMask mobile browser, then use the menu button in the top-left corner to switch between User Profile, RSS / WordPress, Social Posting, Telegram Forward, BlockScam, Login & Cookies, and System Logs.
+
+## MantleFlow Credit Token Mode
+
+This build supports an ERC-20 credit token on Mantle Mainnet instead of direct treasury payments.
+
+### How it works
+
+1. Deploy `contracts/MantleFlowCredit.sol` on Mantle Mainnet.
+2. Users connect an EVM wallet on Mantle Mainnet.
+3. Users click **Buy Credit Tokens** in the dashboard.
+4. The wallet sends `MONTHLY_MNT_AMOUNT` native MNT to the credit-token contract.
+5. The contract mints `MONTHLY_CREDIT_AMOUNT` `MFC` tokens to the user wallet and emits a standard ERC-20 `Transfer` mint event.
+6. The app verifies the mint on Mantle through Etherscan API V2 with `chainid=5000`.
+7. The user unlocks the app for `SUBSCRIPTION_DAYS`; the displayed Credit Balance decreases from 100 Credits to 0 over the monthly period.
+
+### Credit token security model
+
+The token contract uses OpenZeppelin ERC-20 components:
+
+- ERC20 standard token behavior
+- ERC20Burnable so holders can burn tokens
+- ERC20Capped to prevent unlimited supply
+- ERC20Pausable for emergency pause
+- ERC20Permit for gasless approvals
+- AccessControl roles for admin/config/mint/pause permissions
+- ReentrancyGuard around purchase and withdrawal flows
+- Native MNT overpayment refund
+- Transfer burn fee capped at 5% maximum
+
+The default deflation mechanism is a transfer burn fee. The default deployment uses `TRANSFER_BURN_FEE_BPS=200`, meaning 2% of normal wallet-to-wallet transfers is burned. Minting from purchases and direct burns are not taxed.
+
+### Deploy the token on Mantle Mainnet
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Create a local `.env` file for deployment only:
+
+```bash
+DEPLOYER_PRIVATE_KEY=your_deployer_private_key
+MANTLE_RPC_URL=https://rpc.mantle.xyz
+PROJECT_TREASURY=0x152B5F1E58ACD5036D8d2027D3B793e81103E644
+MONTHLY_MNT_AMOUNT=50
+MONTHLY_CREDIT_AMOUNT=100
+SUBSCRIPTION_DAYS=30
+TOKEN_CAP=10000000
+TRANSFER_BURN_FEE_BPS=200
+```
+
+Deploy:
+
+```bash
+npm run deploy:mantle
+```
+
+After deployment, copy the printed contract address and add it to Railway:
+
+```bash
+CREDIT_TOKEN_ADDRESS=0xYourDeployedCreditToken
+CREDIT_TOKEN_SYMBOL=MFC
+```
+
+### Railway variables for token mode
+
+```bash
+RUNTIME_DIR=/data
+PLAYWRIGHT_HEADLESS=1
+PORT=8080
+
+OPENAI_API_KEY=sk-...
+
+MANTLE_RPC_URL=https://rpc.mantle.xyz
+EXPLORER_API_V2_URL=https://api.etherscan.io/v2/api
+EXPLORER_CHAIN_ID=5000
+ETHERSCAN_API_KEY=your_etherscan_api_key
+
+CREDIT_TOKEN_ADDRESS=0xYourDeployedCreditToken
+CREDIT_TOKEN_SYMBOL=MFC
+MONTHLY_MNT_AMOUNT=50
+MONTHLY_CREDIT_AMOUNT=100
+SUBSCRIPTION_DAYS=30
+
+DEFAULT_POSTS_PER_DAY=5
+TEXT_MODEL=gpt-5-nano
+IMAGE_POLICY=high_score
+IMAGE_MIN_SCORE=9
+IMAGE_MODEL=gpt-image-2
+IMAGE_QUALITY=low
+IMAGE_SIZE=1536x1024
+ENABLE_AI_SCAM_DETECTION=1
+BLOCKSCAM_AI_MODEL=gpt-5-nano
+BLOCKSCAM_AI_DELETE_THRESHOLD=7
+```
+
+### Important notes
+
+- Never commit `DEPLOYER_PRIVATE_KEY` to GitHub.
+- Deploy the token first, then set `CREDIT_TOKEN_ADDRESS` in Railway.
+- The project treasury wallet is fixed as `0x152B5F1E58ACD5036D8d2027D3B793e81103E644`.
+- Demo wallet access still works for the same project wallet.
