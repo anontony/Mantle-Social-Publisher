@@ -1,149 +1,105 @@
-# Mantle Social Publisher
+# Mantle Social Publisher + BlockScam ERC-8004
 
-Mantle Social Publisher is a Web3-gated automation dashboard for content publishing and social distribution. Users connect an EVM wallet on Mantle Mainnet, pay a monthly access plan in MNT, and unlock a personal workspace that can automate RSS-based content creation, WordPress publishing, Telegram distribution, X/Facebook posting, Telegram forwarding, and basic scam-message filtering.
+Mantle Social Publisher is a Web3-gated automation dashboard for publishing financial/crypto content, distributing posts to social platforms, forwarding Telegram messages, and moderating Telegram scam messages with optional ERC-8004 proof anchoring on Mantle.
 
-## Core concept
+The project includes:
 
-The app combines three layers:
+- Web3 wallet login on Mantle Mainnet.
+- MFC credit-token access plan.
+- Per-wallet workspace configuration.
+- RSS/API news scanning and AI WordPress article generation.
+- Telegram, X, and Facebook posting.
+- Telegram forwarding.
+- BlockScam Telegram moderation.
+- ERC-8004-compatible moderation evidence reports and optional on-chain proof submission.
+- Railway-friendly deployment.
 
-1. **Web3 account and access layer**
-   - Wallet login with MetaMask, Rabby, Coinbase Wallet, or any injected EVM wallet.
-   - Mantle Mainnet support with chain ID `5000`.
-   - On-chain payment verification for native MNT transfers.
-   - Fixed project owner wallet for subscriptions.
-   - Per-wallet workspace and saved settings.
+---
 
-2. **Publishing automation layer**
-   - Fetches financial and crypto news from RSS / API sources.
-   - Scores news relevance.
-   - Writes a WordPress-ready article in the selected content language.
-   - Optionally generates a featured image.
-   - Publishes to WordPress through the REST API.
-
-3. **Distribution and moderation layer**
-   - Creates a social summary using the same selected language.
-   - Posts to Telegram, X, and Facebook when enabled.
-   - Forwards Telegram channel messages to selected target channels/groups.
-   - Monitors selected Telegram chats for configured scam keywords and attempts removal when the Telegram account has permission.
-
-## Web3 subscription model
-
-The monthly plan is configured server-side and is not editable from the dashboard.
-
-Default plan:
-
-- **100 Credits / month**
-- **50 MNT / month**
-- **30 days access**
-- **Mantle Mainnet**
-- **Chain ID: 5000**
-
-Credit Balance behaves like a monthly usage/status meter. A new subscription starts at `100 Credits`. The value decreases over time based on the remaining subscription window and reaches `0 Credits` when the 30-day plan expires. The dashboard also shows the same balance as a percentage progress bar.
-
-Example:
-
-| Subscription age | Credits left | Percentage |
-|---:|---:|---:|
-| Day 0 | 100 / 100 | 100% |
-| Day 15 | 50 / 100 | 50% |
-| Day 30 | 0 / 100 | 0% |
-
-## Fixed project wallet and demo wallet
-
-Payments are verified against this project owner wallet:
+## 1. Repository structure
 
 ```text
-0x152B5F1E58ACD5036D8d2027D3B793e81103E644
+.
+├── app.py                    # FastAPI dashboard and routes
+├── core.py                   # Services, config, DB, Telegram, WordPress, BlockScam, ERC-8004 proof logic
+├── contracts/
+│   └── MantleFlowCredit.sol  # MFC credit token contract
+├── scripts/
+│   └── deploy.js             # Hardhat deployment script for MFC
+├── Dockerfile
+├── hardhat.config.js
+├── package.json
+├── railway.json
+├── requirements.txt
+├── .env.example
+├── README.md
+└── README_RAILWAY.md
 ```
 
-The wallet is hard-coded in the app and cannot be changed from the dashboard. Runtime settings such as RPC URL, explorer API URL, API key, plan price, and monthly credits are configured through Railway Variables or environment variables.
+Do not commit `.env`, `runtime/`, `/data`, `app.db`, browser profiles, Telegram sessions, or cookies.
 
-The same wallet is also configured as the built-in demo wallet for project review. When this wallet signs in, the dashboard grants a full monthly plan automatically without requiring an on-chain payment check. All other wallets must pay the monthly Mantle plan and pass the on-chain verification step before unlocking the automation features.
+---
 
-## Per-user workspace
+## 2. Requirements
 
-Every connected wallet has its own isolated workspace. Settings saved by one wallet are not visible to another wallet.
+### Python
 
-Saved per wallet:
+Use Python 3.11+.
 
-- OpenAI key override, WordPress URL, WordPress JWT
-- RSS filters, selected categories, content language, scoring settings
-- Telegram API ID, API hash, phone, session name, source channel, target channels
-- X auth token and ct0 cookie
-- Facebook target URL and cookie JSON
-- Social posting switches
-- Telegram forwarding settings
-- BlockScam keyword and chat settings
-
-When a user logs back in with the same wallet, their saved setup is restored automatically.
-
-## Dashboard pages
-
-### Home
-
-Command center with bot status, setup flow, and quick actions.
-
-### User Profile
-
-Wallet connection, subscription status, Credit Balance, payment button, payment verification, and account details.
-
-### RSS / WordPress
-
-Configure news sources, categories, freshness window, minimum score, WordPress credentials, image generation, and content language.
-
-The selected language is synced across:
-
-- WordPress title
-- WordPress article
-- Social summary
-- Telegram post
-- X post
-- Facebook post
-
-### Login & Cookies
-
-Configure Telegram login and optional social cookies.
-
-### Social Posting
-
-Enable or disable Telegram, X, and Facebook posting.
-
-### Telegram Forward
-
-Configure one source channel and multiple target channels/groups.
-
-### BlockScam
-
-Configure monitored chats, scam/risk keywords, and optional AI scam detection. The monitor uses keyword rules first, then sends only unclear messages to the AI classifier. This keeps moderation more accurate without spending unnecessary API calls.
-
-### System Logs
-
-View live application logs.
-
-## Environment variables
-
-Minimum required for Railway:
+Install Python dependencies:
 
 ```bash
-RUNTIME_DIR=/data
-PLAYWRIGHT_HEADLESS=1
+pip install -r requirements.txt
+python -m playwright install chromium
 ```
 
-Recommended server-owned subscription settings:
+### Node.js
+
+Use Node.js LTS, preferably Node 20 or Node 22. Avoid very new Current releases if Hardhat reports unsupported Node warnings.
+
+Install contract dependencies:
 
 ```bash
+npm install
+```
+
+---
+
+## 3. Environment setup
+
+Copy the example environment file:
+
+```bash
+cp .env.example .env
+```
+
+On Windows CMD:
+
+```cmd
+copy .env.example .env
+```
+
+Edit `.env`.
+
+Minimum local development values:
+
+```env
+RUNTIME_DIR=runtime
+PLAYWRIGHT_HEADLESS=0
+PROJECT_OWNER_WALLET=0xYourTreasuryWallet
+PROJECT_TREASURY=0xYourTreasuryWallet
 MANTLE_RPC_URL=https://rpc.mantle.xyz
 EXPLORER_API_V2_URL=https://api.etherscan.io/v2/api
-ETHERSCAN_API_KEY=your_etherscan_api_key
-MONTHLY_MNT_AMOUNT=50
+EXPLORER_CHAIN_ID=5000
+MONTHLY_MNT_AMOUNT=5
 MONTHLY_CREDIT_AMOUNT=100
 SUBSCRIPTION_DAYS=30
 ```
 
 Optional global defaults:
 
-```bash
-OPENAI_API_KEY=your_openai_api_key
+```env
+OPENAI_API_KEY=your_openai_key
 WP_URL=https://your-domain.com/wp-json/wp/v2/posts
 WP_JWT=your_wordpress_jwt
 CRYPTO_PANIC=your_cryptopanic_token
@@ -151,42 +107,96 @@ API_ID=your_telegram_api_id
 API_HASH=your_telegram_api_hash
 ```
 
-Notes:
+Users can also save these values inside their own connected-wallet workspace in the dashboard.
 
-- `ETHERSCAN_API_KEY` is recommended for reliable payment verification on Etherscan API V2 with `chainid=5000`.
-- If `ETHERSCAN_API_KEY` is not set, the app can still try the explorer endpoint, but rate limits may be stricter.
-- Do not commit API keys, JWTs, cookies, Telegram sessions, or database files to GitHub.
+---
 
-## Deploy to Railway
+## 4. Deploy the MFC access token on Mantle
 
-1. Push this repository to GitHub.
-2. Create a new Railway project.
-3. Choose **Deploy from GitHub repo**.
-4. Add a Railway Volume.
-5. Mount the volume at:
+MFC is the credit-token contract used by the dashboard access plan.
 
-```bash
-/data
+The default demo plan is:
+
+```text
+5 MNT -> 100 MFC credits -> 30 days access
 ```
 
-6. Add the environment variables listed above.
-7. Deploy.
-8. Open the generated Railway domain.
-9. Connect a wallet from **User Profile**.
-10. Pay the monthly plan in MNT and click **Refresh Credit Balance**.
-11. Configure WordPress, Telegram, social cookies, and automation settings.
-12. Start the bot.
+### 4.1 Prepare a deployer wallet
 
-## Local development
+Create a dedicated deployer wallet and fund it with a small amount of MNT for gas on Mantle Mainnet.
 
-Install dependencies:
+Add this to `.env`:
 
-```bash
-pip install -r requirements.txt
-python -m playwright install chromium
+```env
+DEPLOYER_PRIVATE_KEY=0xYourDeployerPrivateKey
+PROJECT_TREASURY=0xYourTreasuryWallet
+MANTLE_RPC_URL=https://rpc.mantle.xyz
+MONTHLY_MNT_AMOUNT=5
+MONTHLY_CREDIT_AMOUNT=100
+SUBSCRIPTION_DAYS=30
+TOKEN_CAP=10000000
+TRANSFER_BURN_FEE_BPS=200
 ```
 
-Run the server:
+Never use a seed phrase. Use only the account private key of the deployer wallet. Do not commit `.env`.
+
+### 4.2 Compile the contract
+
+```bash
+npm run compile
+```
+
+Expected output:
+
+```text
+Compiled Solidity files successfully
+```
+
+### 4.3 Deploy to Mantle Mainnet
+
+```bash
+npm run deploy:mantle
+```
+
+The script prints something like:
+
+```text
+MantleFlowCredit deployed to: 0xYourMFCContract
+```
+
+Copy that address.
+
+### 4.4 Add the deployed token to the app
+
+Set these variables locally or in Railway:
+
+```env
+CREDIT_TOKEN_ADDRESS=0xYourMFCContract
+CREDIT_TOKEN_SYMBOL=MFC
+MONTHLY_MNT_AMOUNT=5
+MONTHLY_CREDIT_AMOUNT=100
+SUBSCRIPTION_DAYS=30
+```
+
+The app verifies access by looking for an ERC-20 `Transfer` mint event from the zero address to the connected user wallet, scoped to `CREDIT_TOKEN_ADDRESS`.
+
+### 4.5 Withdraw collected MNT
+
+When users buy credits, they send native MNT to the MFC contract. The contract mints MFC to the user and keeps the MNT balance in the contract.
+
+A wallet with `TREASURY_ROLE` can call:
+
+```solidity
+withdrawNative()
+```
+
+This sends the full native MNT balance from the MFC contract to the configured treasury wallet.
+
+You can call this from MantleScan after verifying the contract, from Remix, or from a custom Hardhat script.
+
+---
+
+## 5. Run locally
 
 ```bash
 uvicorn app:app --host 0.0.0.0 --port 8080
@@ -198,9 +208,99 @@ Open:
 http://localhost:8080
 ```
 
-For local persistent data, the app uses `runtime/` by default. On Railway, it uses `/data` when `RUNTIME_DIR=/data` is set.
+Then:
 
-## WordPress setup
+1. Open **User Profile**.
+2. Connect a Mantle-compatible EVM wallet.
+3. Buy MFC credits.
+4. Click **Refresh Credit Balance**.
+5. Configure WordPress, Telegram, X, Facebook, Telegram Forward, and BlockScam.
+6. Start the bot.
+
+---
+
+## 6. Deploy to Railway
+
+### 6.1 Create Railway project
+
+1. Push this repository to GitHub.
+2. Create a new Railway project.
+3. Choose **Deploy from GitHub repo**.
+4. Add a Railway Volume.
+5. Mount the volume at:
+
+```text
+/data
+```
+
+The volume keeps sessions, SQLite database, browser profiles, and runtime config across redeploys.
+
+### 6.2 Railway variables
+
+Required:
+
+```env
+RUNTIME_DIR=/data
+PLAYWRIGHT_HEADLESS=1
+WEB3_COOKIE_SECURE=1
+WEB3_COOKIE_SAMESITE=none
+PORT=8080
+
+PROJECT_OWNER_WALLET=0xYourTreasuryWallet
+PROJECT_TREASURY=0xYourTreasuryWallet
+MANTLE_RPC_URL=https://rpc.mantle.xyz
+EXPLORER_API_V2_URL=https://api.etherscan.io/v2/api
+EXPLORER_CHAIN_ID=5000
+ETHERSCAN_API_KEY=your_etherscan_api_key
+
+CREDIT_TOKEN_ADDRESS=0xYourMFCContract
+CREDIT_TOKEN_SYMBOL=MFC
+MONTHLY_MNT_AMOUNT=5
+MONTHLY_CREDIT_AMOUNT=100
+SUBSCRIPTION_DAYS=30
+```
+
+Optional global defaults:
+
+```env
+OPENAI_API_KEY=your_openai_key
+WP_URL=https://your-domain.com/wp-json/wp/v2/posts
+WP_JWT=your_wordpress_jwt
+CRYPTO_PANIC=your_cryptopanic_token
+API_ID=your_telegram_api_id
+API_HASH=your_telegram_api_hash
+DEMO_WALLETS=0xWalletOne,0xWalletTwo
+```
+
+### 6.3 Deploy
+
+After adding variables, redeploy the Railway service and open the generated Railway domain.
+
+---
+
+## 7. Dashboard setup
+
+### 7.1 User Profile
+
+Use this page to:
+
+- Connect wallet.
+- Buy MFC credits.
+- Refresh access status.
+- View credit balance and subscription expiry.
+
+### 7.2 RSS / WordPress
+
+Configure:
+
+- OpenAI API key.
+- WordPress REST URL.
+- WordPress JWT.
+- CryptoPanic token.
+- Categories and custom topic filters.
+- Content language.
+- AI text model.
+- Image generation policy.
 
 The WordPress REST URL should look like:
 
@@ -208,133 +308,268 @@ The WordPress REST URL should look like:
 https://your-domain.com/wp-json/wp/v2/posts
 ```
 
-The JWT must allow creating posts and uploading media. If image generation is enabled, the app will create a featured image and upload it to the WordPress media endpoint.
+The WordPress JWT must allow post creation and media upload.
 
-## Telegram setup
+### 7.3 Login & Cookies
 
-1. Create a Telegram API app and get `API ID` and `API Hash`.
-2. Open the dashboard.
-3. Go to **Login & Cookies**.
-4. Enter API ID, API Hash, phone number, and session name.
-5. Click **Send Telegram Code**.
-6. Enter the code received on Telegram.
-7. If your account has 2FA, enter the 2FA password.
-8. Click **Confirm Code**.
-9. Use **Test Telegram Session**.
+This page now includes expandable English setup guides for Telegram, X, and Facebook.
 
-Telegram sessions are stored under the configured runtime directory and are separated by wallet workspace.
+#### Telegram
 
-## API cost optimization
+Required:
 
-The publishing pipeline is optimized to publish 5 hot articles per day by default and reduce OpenAI API cost:
+- Telegram API ID.
+- Telegram API Hash.
+- Session name.
+- Phone number.
+- Optional Telegram posting channel.
 
-- The scheduler defaults to `Posts Per Day: 5`, which spaces publishing across the day. Each run scans available RSS/API candidates and selects the highest-scoring hot item in that batch.
-- RSS candidate scoring uses a local heuristic by default instead of calling AI for every news item.
-- Title, WordPress article, and social draft are generated in one text API call.
-- The default text model is `gpt-5-nano`. You can switch to `gpt-5-mini` in the dashboard when stronger writing is needed.
-- Featured image generation is controlled by an Image Policy:
-  - `Off`: no image cost.
-  - `High-score news only`: generate images only for selected high-impact news.
-  - `Every post`: generate an image for every article.
-- The default image setup is `gpt-image-2`, `low` quality, and `1536x1024` landscape.
+Flow:
 
-Recommended production setup:
+1. Create a Telegram app at `my.telegram.org`.
+2. Save API ID and API Hash.
+3. Enter phone and session name.
+4. Click **Send Telegram Code**.
+5. Enter code and 2FA password if needed.
+6. Click **Confirm Code**.
+7. Click **Test Session**.
 
-```text
-Posts Per Day: 5
-Text Model: gpt-5-nano
-AI RSS Scoring: Off
-Image Policy: High-score news only
-Image Min Score: 9
-Image Model: gpt-image-2
-Image Quality: low
-Image Size: 1536x1024
+The Telegram account must have permission to post, delete messages, and ban users in target groups if BlockScam is enabled.
+
+#### X / Twitter
+
+Required:
+
+- `auth_token` cookie.
+- `ct0` cookie.
+
+After saving, click **Test X Post**.
+
+#### Facebook
+
+Required:
+
+- Facebook target URL.
+- Facebook cookie JSON.
+
+After saving, click **Test Facebook Post**.
+
+### 7.4 Social Posting
+
+Enable or disable posting to:
+
+- Telegram.
+- X.
+- Facebook.
+
+### 7.5 Telegram Forward
+
+Configure one source channel and multiple target channels/groups.
+
+### 7.6 BlockScam
+
+Configure:
+
+- Telegram chats to scan.
+- Scam keywords.
+- Optional AI scam detection.
+- ERC-8004 proof settings.
+
+---
+
+## 8. BlockScam moderation flow
+
+When a user posts a suspicious Telegram message, BlockScam:
+
+1. Reads the message.
+2. Runs keyword rules.
+3. Optionally calls the AI classifier.
+4. Deletes suspicious messages.
+5. Blocks/kicks the sender for high-risk messages when the Telegram account has permission.
+6. Builds a moderation evidence report.
+7. Hashes the report.
+8. Saves the proof locally in SQLite.
+9. Optionally submits the proof hash on-chain through ERC-8004 validation flow.
+
+Example evidence fields:
+
+```json
+{
+  "type": "telegram_moderation_action",
+  "standard": "ERC-8004-compatible-offchain-evidence",
+  "agentRegistry": "0x...",
+  "agentId": "12",
+  "platform": "telegram",
+  "chatHash": "0x...",
+  "userHash": "0x...",
+  "messageHash": "0x...",
+  "action": "delete_message_and_block_user",
+  "riskScore": 94,
+  "matchedRules": ["FREE_USDT_LURE", "CONTACT_ME_PATTERN"],
+  "originalMessageRedacted": "Ai muốn kiếm **** miễn phí liên hệ tôi"
+}
 ```
 
-Use `gpt-5-mini` only for premium users or when article quality matters more than cost. Use `Image Policy: Off` if the WordPress theme already has default thumbnails or if you want the lowest possible cost.
+The bot does not put raw Telegram IDs, full usernames, full group names, or full private messages on-chain. It stores a proof hash on-chain and keeps detailed evidence off-chain.
 
-## X / Facebook setup
+---
 
-The dashboard supports cookie-based posting with Playwright.
+## 9. ERC-8004 proof setup
 
-X requires:
+ERC-8004 proof anchoring is optional. Local proof storage works even without on-chain configuration.
 
-```text
-auth_token
-ct0
+### 9.1 Environment variables
+
+```env
+ENABLE_ERC8004_PROOF=1
+ERC8004_RPC_URL=https://rpc.mantle.xyz
+ERC8004_AGENT_REGISTRY=0x8004A169FB4a3325136EB29fA0ceB6D2e539a432
+ERC8004_REPUTATION_REGISTRY=0x8004BAa17C55a88189AE136b182e5fdA19dE9b63
+ERC8004_VALIDATION_REGISTRY=0xYourValidationRegistry
+ERC8004_VALIDATOR_ADDRESS=0xYourValidatorAddress
+ERC8004_AGENT_ID=YourAgentId
+ERC8004_EVIDENCE_BASE_URL=https://your-railway-domain.up.railway.app
+ERC8004_PRIVATE_KEY=0xProofWriterPrivateKey
+ERC8004_ONCHAIN_MIN_SCORE=90
 ```
 
-Facebook requires cookie JSON and a target URL.
+### 9.2 Agent identity
 
-Because social platforms can change UI selectors or session policies at any time, the dashboard includes test buttons for X and Facebook. Use them after saving cookies.
+Register a BlockScam agent in the ERC-8004 Identity Registry and save the returned `agentId`.
 
-## Payment verification
-
-Payment verification checks native MNT transfers from the connected wallet to the fixed project owner wallet.
-
-The app uses Etherscan API V2 with:
+The evidence report binds moderation proof to:
 
 ```text
-chainid=5000
-module=account
-action=txlist
+agentRegistry + agentId + proofHash
 ```
 
-A valid transaction must:
+### 9.3 Validation Registry and Validator
 
-- Be sent from the connected wallet.
-- Be sent to the fixed project owner wallet.
-- Be on Mantle Mainnet.
-- Be a successful transaction.
-- Meet or exceed `MONTHLY_MNT_AMOUNT`.
-- Be within the configured monthly window, default `30` days.
+The app calls:
 
-The demo wallet skips this payment check and receives a full plan automatically.
+```solidity
+validationRequest(validatorAddress, agentId, requestURI, requestHash)
+```
 
-## Security notes
+You must provide:
 
-- Never commit `.env`, `runtime/`, `/data`, `app.db`, browser profiles, Telegram sessions, or cookies.
-- Use Railway Variables for server-owned secrets.
-- The project owner wallet is fixed in code to prevent user-side replacement.
-- The demo wallet is fixed in code for project review access.
-- Users only see and save their own workspace settings.
-- Cookies and API keys are sensitive. Keep the Railway project private and restrict dashboard access if needed.
+- `ERC8004_VALIDATION_REGISTRY`
+- `ERC8004_VALIDATOR_ADDRESS`
+- `ERC8004_AGENT_ID`
+- `ERC8004_PRIVATE_KEY`
 
-## Suggested repository structure
+`ERC8004_PRIVATE_KEY` should be a dedicated proof-writer wallet with only enough MNT for gas. Do not use the treasury wallet or a wallet holding major funds.
+
+### 9.4 Proof endpoints
+
+The app exposes:
 
 ```text
-.
-├── app.py
-├── core.py
-├── Dockerfile
-├── railway.json
-├── requirements.txt
-├── README.md
-└── README_RAILWAY.md
+/blockscam/proofs
+/proof/{proof_hash}
 ```
 
-## Production checklist
+Use these to review local evidence and compare it with on-chain proof hashes.
 
-- [ ] Railway Volume mounted to `/data`
-- [ ] `RUNTIME_DIR=/data`
-- [ ] `PLAYWRIGHT_HEADLESS=1`
-- [ ] `ETHERSCAN_API_KEY` configured
-- [ ] WordPress URL and JWT tested
-- [ ] Telegram session tested
-- [ ] X/Facebook cookies tested if social posting is enabled
-- [ ] Wallet payment tested on Mantle Mainnet
-- [ ] Credit Balance refresh tested
-- [ ] GitHub repository excludes runtime files and secrets
+---
 
-## Mobile UX
+## 10. Security notes
 
-The dashboard includes a responsive mobile interface for phone users:
+- Never commit `.env`.
+- Never commit private keys, API keys, cookies, WordPress JWTs, Telegram sessions, browser profiles, `runtime/`, `/data`, or `app.db`.
+- Use a dedicated deployer wallet for contracts.
+- Use a dedicated proof-writer wallet for ERC-8004 proof transactions.
+- Use a dedicated automation account for social posting.
+- Keep Railway private and restrict access to the dashboard.
+- If a cookie or private key is leaked, rotate it immediately.
 
-- Sticky mobile top bar
-- Slide-in sidebar menu
-- Full-width touch-friendly buttons
-- Single-column forms
-- Larger mobile inputs to avoid iOS zoom
-- Mobile-friendly logs, profile cards, and Web3 wallet actions
+---
 
-Open the app on a phone browser or in MetaMask mobile browser, then use the menu button in the top-left corner to switch between User Profile, RSS / WordPress, Social Posting, Telegram Forward, BlockScam, Login & Cookies, and System Logs.
+## 11. Common commands
+
+Install Python dependencies:
+
+```bash
+pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+Install contract dependencies:
+
+```bash
+npm install
+```
+
+Compile contracts:
+
+```bash
+npm run compile
+```
+
+Deploy MFC token:
+
+```bash
+npm run deploy:mantle
+```
+
+Run app locally:
+
+```bash
+uvicorn app:app --host 0.0.0.0 --port 8080
+```
+
+Clean Node dependencies on Windows CMD:
+
+```cmd
+rmdir /s /q node_modules
+del package-lock.json
+npm install
+```
+
+Clean Node dependencies on PowerShell:
+
+```powershell
+Remove-Item -Recurse -Force node_modules
+Remove-Item -Force package-lock.json
+npm install
+```
+
+---
+
+## 12. Troubleshooting
+
+### Hardhat says Node.js is unsupported
+
+Install Node.js LTS, preferably Node 20 or Node 22.
+
+### Solidity compile error: `mcopy not found`
+
+Make sure OpenZeppelin is pinned to `5.0.2`:
+
+```bash
+npm install @openzeppelin/contracts@5.0.2 --save-exact
+npm run compile
+```
+
+### User paid but access is not active
+
+Check:
+
+- `CREDIT_TOKEN_ADDRESS` is set to the deployed MFC contract.
+- `MONTHLY_MNT_AMOUNT` matches the contract deployment value.
+- The transaction confirmed on Mantle Mainnet.
+- `ETHERSCAN_API_KEY` is set in Railway for reliable explorer checks.
+- User clicked **Refresh Credit Balance** after the transaction confirmed.
+
+### Telegram BlockScam does not delete messages
+
+Check:
+
+- Telegram session is logged in.
+- The account is admin in the target group.
+- The account has delete-message and ban-user permissions.
+- Target chats are entered correctly.
+
+### Social posting fails
+
+Cookies may have expired or the platform UI may have changed. Re-export cookies and use the test buttons.

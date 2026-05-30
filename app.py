@@ -752,10 +752,12 @@ def save_from_form(data: Dict[str, Any]) -> None:
         "openai_api_key", "wp_url", "wp_jwt", "crypto_panic", "custom_topic_filter", "content_language",
         "ai_text_model", "image_policy", "image_model", "image_quality", "image_size",
         "block_scam_ai_model",
-        "telegram_api_id", "telegram_api_hash", "telegram_session_name", "telegram_phone",
+        "telegram_api_id", "telegram_api_hash", "telegram_session_name", "telegram_phone", "telegram_post_channel_url",
         "telegram_source_channel", "telegram_target_channels",
         "x_auth_token", "x_ct0", "facebook_cookie_json", "facebook_target_url",
         "block_scam_keywords", "block_scam_target_chats", "wp_publish_status",
+        "erc8004_rpc_url", "erc8004_agent_registry", "erc8004_reputation_registry", "erc8004_validation_registry",
+        "erc8004_validator_address", "erc8004_agent_id", "erc8004_evidence_base_url", "erc8004_private_key",
     ]
     for field in text_fields:
         if field in data:
@@ -777,7 +779,7 @@ def save_from_form(data: Dict[str, Any]) -> None:
             set_cfg_field(field, value)
     apply_server_subscription_settings(cfg)
 
-    int_defaults = {"min_score": 7, "post_interval_seconds": 17280, "posts_per_day": 5, "recent_hours": 6, "image_min_score": 9, "block_scam_ai_threshold": 7}
+    int_defaults = {"min_score": 7, "post_interval_seconds": 17280, "posts_per_day": 5, "recent_hours": 6, "image_min_score": 9, "block_scam_ai_threshold": 7, "erc8004_onchain_min_score": 90}
     for field, default in int_defaults.items():
         if field in data:
             try:
@@ -788,7 +790,7 @@ def save_from_form(data: Dict[str, Any]) -> None:
 
     bool_fields = [
         "create_image", "enable_ai_scoring", "enable_telegram_forward", "enable_telegram_social_post",
-        "enable_x_post", "enable_facebook_post", "enable_block_scam", "enable_block_scam_ai",
+        "enable_x_post", "enable_facebook_post", "enable_block_scam", "enable_block_scam_ai", "enable_erc8004_proof",
     ]
     for field in bool_fields:
         marker = f"bool__{field}"
@@ -1098,6 +1100,16 @@ a{{color:#ff8bd8;font-weight:800}}
 option{{background:#14121e;color:var(--text)}}
 ::placeholder{{color:#766985}}
 .help{{font-size:13px;color:var(--muted);margin-top:8px}}
+.setup-guide{{margin:14px 0;background:rgba(255,255,255,.045);border:1px solid var(--line);border-radius:18px;overflow:hidden}}
+.setup-guide summary{{cursor:pointer;list-style:none;padding:13px 15px;font-weight:950;color:#fff;background:rgba(255,255,255,.055)}}
+.setup-guide summary::-webkit-details-marker{{display:none}}
+.setup-guide summary:after{{content:"▼";float:right;color:var(--muted);font-size:12px;margin-top:3px}}
+.setup-guide[open] summary:after{{content:"▲"}}
+.setup-guide-body{{padding:14px 16px;color:var(--muted);line-height:1.55}}
+.setup-guide-body h4{{margin:10px 0 6px;color:#fff;font-size:15px}}
+.setup-guide-body ol,.setup-guide-body ul{{margin:8px 0 12px 20px;padding:0}}
+.setup-guide-body li{{margin:6px 0}}
+.setup-guide-body code{{background:rgba(255,255,255,.08);padding:2px 6px;border-radius:8px;color:#fff}}
 
 .mobile-topbar{{display:none}}
 .mobile-overlay{{display:none}}
@@ -1336,7 +1348,7 @@ option{{background:#14121e;color:var(--text)}}
     </div>
     {msg_html}
     {content}
-    {'' if tab == 'log' else f'<div class="card"><h3>Logs</h3><pre>{logs}</pre><p><a href="/logs" target="_blank">Open raw logs</a></p></div>'}
+    {'' if tab == 'log' else f'<div class="card"><h3>Live Logs</h3><pre id="liveLogs" data-live-logs="1">{logs}</pre><p class="help"><span id="liveLogStatus">Auto-refreshing...</span> · <a href="/logs" target="_blank">Open raw logs</a></p></div>'}
   </main>
 </div>
 
@@ -1372,6 +1384,35 @@ document.addEventListener('DOMContentLoaded', () => {{
       button.textContent = hidden ? '🙈' : '👁';
     }});
   }});
+
+  const liveLogs = document.querySelector('[data-live-logs]');
+  const liveLogStatus = document.getElementById('liveLogStatus');
+  let lastLogText = liveLogs ? liveLogs.textContent : '';
+
+  async function refreshLiveLogs() {{
+    if (!liveLogs) return;
+    try {{
+      const response = await fetch('/logs?ts=' + Date.now(), {{ cache: 'no-store', credentials: 'same-origin' }});
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      const text = await response.text();
+      if (text !== lastLogText) {{
+        const nearBottom = liveLogs.scrollTop + liveLogs.clientHeight >= liveLogs.scrollHeight - 40;
+        liveLogs.textContent = text;
+        lastLogText = text;
+        if (nearBottom) liveLogs.scrollTop = liveLogs.scrollHeight;
+      }}
+      if (liveLogStatus) liveLogStatus.textContent = 'Live · updated ' + new Date().toLocaleTimeString();
+    }} catch (error) {{
+      if (liveLogStatus) liveLogStatus.textContent = 'Live log reconnecting...';
+    }}
+  }}
+
+  if (liveLogs) {{
+    liveLogs.scrollTop = liveLogs.scrollHeight;
+    refreshLiveLogs();
+    setInterval(refreshLiveLogs, 2000);
+  }}
+
 }});
 </script>
 </body>
@@ -2032,9 +2073,23 @@ def login_content() -> str:
       <label>API Hash</label>{secret_input("telegram_api_hash", cfg.telegram_api_hash)}
       <label>Session name</label><input name="telegram_session_name" value="{esc(cfg.telegram_session_name)}">
       <label>Phone</label><input name="telegram_phone" value="{esc(cfg.telegram_phone)}">
+      <label>Telegram posting channel</label><input name="telegram_post_channel_url" value="{esc(getattr(cfg, 'telegram_post_channel_url', ''))}" placeholder="@yourchannel or https://t.me/yourchannel">
     </div>
     <div class="actions"><button class="primary">Save Telegram</button></div>
   </form>
+  <details class="setup-guide">
+    <summary>Telegram setup guide</summary>
+    <div class="setup-guide-body">
+      <ol>
+        <li>Go to <code>my.telegram.org</code> and sign in with the Telegram account that will manage your groups or channels.</li>
+        <li>Open <b>API development tools</b>, create an app, then copy the <b>API ID</b> and <b>API Hash</b>.</li>
+        <li>Paste the API ID, API Hash, phone number, and session name in this form.</li>
+        <li>For social posting, enter a Telegram channel or group such as <code>@yourchannel</code> or <code>https://t.me/yourchannel</code>.</li>
+        <li>Click <b>Save Telegram</b>, then <b>Send Telegram Code</b>. Enter the code received in Telegram and your 2FA password if Telegram asks for it.</li>
+        <li>Click <b>Test Session</b>. Make sure the Telegram account has permission to post, delete messages, and ban users in the target groups if BlockScam is enabled.</li>
+      </ol>
+    </div>
+  </details>
   <div class="actions">
     <form method="post" action="/telegram/send-code"><button>Send Telegram Code</button></form>
     <form method="post" action="/telegram/test"><button>Test Session</button></form>
@@ -2062,6 +2117,18 @@ def login_content() -> str:
     <div class="checkrow"><label><input type="checkbox" name="enable_x_post" {checked('enable_x_post')}> Enable X Posting</label></div>
     <div class="actions"><button class="primary">Save X Cookie</button></div>
   </form>
+  <details class="setup-guide">
+    <summary>X / Twitter setup guide</summary>
+    <div class="setup-guide-body">
+      <ol>
+        <li>Log in to X in a normal browser session.</li>
+        <li>Open the browser developer tools and copy the cookies named <code>auth_token</code> and <code>ct0</code> from the <code>x.com</code> domain.</li>
+        <li>Paste both values above, enable X posting, then save.</li>
+        <li>Click <b>Test X Post</b>. If the test fails, refresh the cookies because X may have expired the session.</li>
+      </ol>
+      <p>Use a dedicated social account for automation. Platform UI changes can require selector updates.</p>
+    </div>
+  </details>
   <form method="post" action="/test-x"><button>Test X Post</button></form>
 </div>
 
@@ -2076,6 +2143,19 @@ def login_content() -> str:
     <div class="checkrow"><label><input type="checkbox" name="enable_facebook_post" {checked('enable_facebook_post')}> Enable Facebook Posting</label></div>
     <div class="actions"><button class="primary">Save Facebook Cookie</button></div>
   </form>
+  <details class="setup-guide">
+    <summary>Facebook setup guide</summary>
+    <div class="setup-guide-body">
+      <ol>
+        <li>Log in to Facebook in a normal browser session with the account that can post to your profile, page, or group.</li>
+        <li>Export Facebook cookies as JSON from your browser using a trusted cookie export extension or your browser developer tools.</li>
+        <li>Paste the full cookie JSON above. Keep it private because it can grant account access.</li>
+        <li>Enter the target URL where the bot should create the post, for example a profile, page, or group URL.</li>
+        <li>Enable Facebook posting, save, then click <b>Test Facebook Post</b>.</li>
+      </ol>
+      <p>If Facebook shows checkpoint, login, or permission screens, renew the cookie JSON and confirm that the account can post to the target URL manually.</p>
+    </div>
+  </details>
   <form method="post" action="/test-facebook"><button>Test Facebook Post</button></form>
 </div>
 """
@@ -2130,9 +2210,10 @@ def blockscam_content() -> str:
 <form method="post" action="/save?next=blockscam">
 <input type="hidden" name="bool__enable_block_scam" value="1">
 <input type="hidden" name="bool__enable_block_scam_ai" value="1">
+<input type="hidden" name="bool__enable_erc8004_proof" value="1">
 <div class="card">
   <h3>AI BlockScam Monitor</h3>
-  <p class="help">BlockScam uses fast keyword rules first, then optional AI classification for messages that are not obvious by keyword. This improves accuracy while keeping API cost low.</p>
+  <p class="help">BlockScam uses fast keyword rules first, then optional AI classification. When a scam action is taken, the bot creates a moderation proof hash and can submit it to an ERC-8004 Validation Registry.</p>
   <div class="checkrow">
     <label><input type="checkbox" name="enable_block_scam" {checked('enable_block_scam')}> Enable BlockScam</label>
     <label><input type="checkbox" name="enable_block_scam_ai" {checked('enable_block_scam_ai')}> Enable AI Scam Detection</label>
@@ -2147,11 +2228,33 @@ def blockscam_content() -> str:
   </div>
   <label>Chats to Scan, one group/channel per line</label><textarea name="block_scam_target_chats">{esc(cfg.block_scam_target_chats)}</textarea>
   <label>Scam Keywords, one keyword per line</label><textarea name="block_scam_keywords">{esc(cfg.block_scam_keywords)}</textarea>
-  <div class="actions"><button class="primary">Save Configuration</button></div>
+</div>
+
+<div class="card">
+  <h3>ERC-8004 Proof Settings</h3>
+  <p class="help">For every high-risk moderation action, BlockScam stores a local evidence report and proof hash. If these fields are configured, it also sends validationRequest(validatorAddress, agentId, requestURI, proofHash) on Mantle.</p>
+  <div class="checkrow">
+    <label><input type="checkbox" name="enable_erc8004_proof" {checked('enable_erc8004_proof')}> Enable ERC-8004 On-chain Proof</label>
+  </div>
+  <div class="grid">
+    <label>Mantle / ERC-8004 RPC URL</label><input name="erc8004_rpc_url" value="{esc(getattr(cfg, 'erc8004_rpc_url', ''))}" placeholder="https://rpc.mantle.xyz">
+    <label>Agent Registry</label><input name="erc8004_agent_registry" value="{esc(getattr(cfg, 'erc8004_agent_registry', ''))}">
+    <label>Reputation Registry</label><input name="erc8004_reputation_registry" value="{esc(getattr(cfg, 'erc8004_reputation_registry', ''))}">
+    <label>Validation Registry</label><input name="erc8004_validation_registry" value="{esc(getattr(cfg, 'erc8004_validation_registry', ''))}" placeholder="0x... provided by your validator or ERC-8004 deployment">
+    <label>Validator Address</label><input name="erc8004_validator_address" value="{esc(getattr(cfg, 'erc8004_validator_address', ''))}" placeholder="0x...">
+    <label>BlockScam Agent ID</label><input name="erc8004_agent_id" value="{esc(getattr(cfg, 'erc8004_agent_id', ''))}" placeholder="Example: 12">
+    <label>Evidence Base URL</label><input name="erc8004_evidence_base_url" value="{esc(getattr(cfg, 'erc8004_evidence_base_url', ''))}" placeholder="https://your-railway-domain.up.railway.app">
+    <label>Proof writer private key</label>{secret_input('erc8004_private_key', getattr(cfg, 'erc8004_private_key', ''))}
+    <label>On-chain Min Score</label><input name="erc8004_onchain_min_score" value="{esc(getattr(cfg, 'erc8004_onchain_min_score', 90))}" placeholder="90">
+  </div>
+  <div class="actions">
+    <button class="primary">Save BlockScam + ERC-8004</button>
+    <a class="button" href="/blockscam/proofs" target="_blank">View Proofs</a>
+  </div>
+  <p class="help">Local proof always works. On-chain proof requires web3 in requirements.txt, a funded Mantle wallet, a registered Agent ID, Validation Registry, and Validator Address.</p>
 </div>
 </form>
 """
-
 
 def log_content() -> str:
     drain_logs()
@@ -2162,8 +2265,8 @@ def log_content() -> str:
 <div class="card">
   <h3>Workspace Logs</h3>
   <p class="help">Only logs generated by the connected wallet workspace are shown here.</p>
-  <pre>{logs}</pre>
-  <p><a href="/logs" target="_blank">Open raw wallet logs</a></p>
+  <pre id="liveLogs" data-live-logs="1">{logs}</pre>
+  <p class="help"><span id="liveLogStatus">Auto-refreshing...</span> · <a href="/logs" target="_blank">Open raw wallet logs</a></p>
 </div>
 """
 
@@ -2502,8 +2605,77 @@ def logs(request: Request):
     drain_logs()
     user = get_current_user(request)
     if not user:
-        return "Connect a wallet to view private workspace logs."
-    return "\n".join(logs_for_user(user, MAX_LOGS))
+        text = "Connect a wallet to view private workspace logs."
+    else:
+        text = "\n".join(logs_for_user(user, MAX_LOGS))
+    return PlainTextResponse(text, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"})
+
+
+
+@app.get("/blockscam/proofs", response_class=HTMLResponse)
+def blockscam_proofs(request: Request):
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse("/?tab=profile&msg=loginrequired", status_code=303)
+    activate_config_for_user(user)
+    with auth_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT proof_hash, action, risk_score, tx_hash, created_at
+            FROM moderation_proofs
+            ORDER BY id DESC
+            LIMIT 100
+            """
+        ).fetchall()
+    items = []
+    base = (getattr(cfg, "erc8004_evidence_base_url", "") or "").strip().rstrip("/")
+    for row in rows:
+        proof_hash = row["proof_hash"]
+        evidence_url = f"/proof/{esc(proof_hash)}"
+        tx = row["tx_hash"] or "local-only"
+        tx_html = esc(tx)
+        if str(tx).startswith("0x") and len(str(tx)) > 20:
+            tx_html = f'<a href="https://mantlescan.xyz/tx/{esc(tx)}" target="_blank">{esc(tx[:10])}...{esc(tx[-8:])}</a>'
+        items.append(
+            f"<tr><td><a href='{evidence_url}' target='_blank'>{esc(proof_hash[:12])}...{esc(proof_hash[-8:])}</a></td>"
+            f"<td>{esc(row['action'])}</td><td>{esc(row['risk_score'])}</td><td>{tx_html}</td><td>{esc(row['created_at'])}</td></tr>"
+        )
+    table = "".join(items) or "<tr><td colspan='5'>No proofs yet.</td></tr>"
+    content = f"""
+    <div class="card">
+      <h3>BlockScam Moderation Proofs</h3>
+      <p class="help">These are local evidence hashes. Rows with a tx hash were also anchored through the configured ERC-8004 validation flow.</p>
+      <table style="width:100%;border-collapse:collapse;overflow-wrap:anywhere">
+        <thead><tr><th align="left">Proof</th><th align="left">Action</th><th align="left">Score</th><th align="left">Tx</th><th align="left">Created</th></tr></thead>
+        <tbody>{table}</tbody>
+      </table>
+    </div>
+    """
+    return page_shell("blockscam", "BlockScam Proofs", content, user=user)
+
+
+@app.get("/proof/{proof_hash}", response_class=JSONResponse)
+def blockscam_proof_json(proof_hash: str, request: Request):
+    user = get_current_user(request)
+    if not user:
+        return JSONResponse({"error": "Connect wallet to view workspace proof evidence."}, status_code=401)
+    with auth_conn() as conn:
+        row = conn.execute(
+            "SELECT proof_hash, report_json, tx_hash, created_at FROM moderation_proofs WHERE proof_hash=?",
+            (proof_hash,),
+        ).fetchone()
+    if not row:
+        return JSONResponse({"error": "Proof not found."}, status_code=404)
+    try:
+        report = json.loads(row["report_json"])
+    except Exception:
+        report = {"raw": row["report_json"]}
+    return JSONResponse({
+        "proof_hash": row["proof_hash"],
+        "report": report,
+        "tx_hash": row["tx_hash"],
+        "created_at": row["created_at"],
+    })
 
 
 @app.get("/health", response_class=PlainTextResponse)

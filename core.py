@@ -6,6 +6,7 @@ import sys
 import json
 import time
 import base64
+import hashlib
 import queue
 import random
 import sqlite3
@@ -35,8 +36,19 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 # =========================================================
 
 APP_NAME = "Mantle Social Publisher"
-PROJECT_OWNER_WALLET = "0x152B5F1E58ACD5036D8d2027D3B793e81103E644"
-PROJECT_DEMO_WALLETS = {PROJECT_OWNER_WALLET.lower()}
+DEFAULT_PROJECT_OWNER_WALLET = "0x0000000000000000000000000000000000000000"
+PROJECT_OWNER_WALLET = (
+    os.getenv("PROJECT_OWNER_WALLET")
+    or os.getenv("PROJECT_TREASURY")
+    or DEFAULT_PROJECT_OWNER_WALLET
+).strip()
+
+_demo_wallets_raw = os.getenv("DEMO_WALLETS", "").strip()
+PROJECT_DEMO_WALLETS = {
+    wallet.strip().lower()
+    for wallet in re.split(r"[,\n]+", _demo_wallets_raw)
+    if wallet.strip().startswith("0x") and len(wallet.strip()) == 42
+}
 CREDIT_TOKEN_SYMBOL = "MFC"
 CONTENT_LANGUAGES = ["English", "Vietnamese", "Indonesian", "Thai", "Chinese", "Korean", "Japanese", "Spanish", "French", "Portuguese", "Hindi"]
 
@@ -191,13 +203,14 @@ class AppConfig:
     telegram_session_name: str = "forward_session"
     telegram_phone: str = ""
 
-    telegram_source_channel: str = "dttdsignal"
-    telegram_target_channels: str = (
-        "@tradingsignal12221\n"
-        "@KriptoHaberleri2025\n"
-        "@backfeecrypto\n"
-        "@cryptodautu\n"
-    )
+    telegram_source_channel: str = ""
+
+    # Primary Telegram channel/group for social posts. This is shown in Login & Cookies
+    # next to Telegram login settings, similar to Facebook Target URL.
+    telegram_post_channel_url: str = ""
+
+    # Existing multi-target field is kept for forward/social workflows.
+    telegram_target_channels: str = ""
     enable_telegram_forward: bool = False
     enable_telegram_social_post: bool = True
 
@@ -214,7 +227,7 @@ class AppConfig:
     mantle_rpc_url: str = "https://rpc.mantle.xyz"
     mantlescan_api_url: str = "https://api.etherscan.io/v2/api"
     mantlescan_api_key: str = ""
-    monthly_mnt_amount: float = 50.0
+    monthly_mnt_amount: float = 5.0
     monthly_credit_amount: int = 100
     credit_token_address: str = ""
     credit_token_symbol: str = CREDIT_TOKEN_SYMBOL
@@ -240,6 +253,18 @@ class AppConfig:
     )
     block_scam_target_chats: str = ""
 
+    # ERC-8004 / BlockScam moderation proof settings
+    enable_erc8004_proof: bool = False
+    erc8004_rpc_url: str = "https://rpc.mantle.xyz"
+    erc8004_agent_registry: str = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"
+    erc8004_reputation_registry: str = "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63"
+    erc8004_validation_registry: str = ""
+    erc8004_validator_address: str = ""
+    erc8004_agent_id: str = ""
+    erc8004_evidence_base_url: str = ""
+    erc8004_private_key: str = ""
+    erc8004_onchain_min_score: int = 90
+
 
 def apply_server_subscription_settings(cfg: AppConfig) -> AppConfig:
     """Apply server-owned subscription settings from environment variables.
@@ -253,10 +278,26 @@ def apply_server_subscription_settings(cfg: AppConfig) -> AppConfig:
     cfg.mantlescan_api_key = os.getenv("ETHERSCAN_API_KEY", os.getenv("MANTLESCAN_API_KEY", cfg.mantlescan_api_key)).strip()
     cfg.credit_token_address = os.getenv("CREDIT_TOKEN_ADDRESS", cfg.credit_token_address).strip()
     cfg.credit_token_symbol = os.getenv("CREDIT_TOKEN_SYMBOL", cfg.credit_token_symbol or CREDIT_TOKEN_SYMBOL).strip() or CREDIT_TOKEN_SYMBOL
+
+    # ERC-8004 defaults can be injected from Railway Variables. User/workspace values
+    # are preserved unless an environment variable is explicitly provided.
+    cfg.erc8004_rpc_url = os.getenv("ERC8004_RPC_URL", cfg.erc8004_rpc_url or cfg.mantle_rpc_url).strip() or cfg.mantle_rpc_url
+    cfg.erc8004_agent_registry = os.getenv("ERC8004_AGENT_REGISTRY", cfg.erc8004_agent_registry).strip()
+    cfg.erc8004_reputation_registry = os.getenv("ERC8004_REPUTATION_REGISTRY", cfg.erc8004_reputation_registry).strip()
+    cfg.erc8004_validation_registry = os.getenv("ERC8004_VALIDATION_REGISTRY", cfg.erc8004_validation_registry).strip()
+    cfg.erc8004_validator_address = os.getenv("ERC8004_VALIDATOR_ADDRESS", cfg.erc8004_validator_address).strip()
+    cfg.erc8004_agent_id = os.getenv("ERC8004_AGENT_ID", cfg.erc8004_agent_id).strip()
+    cfg.erc8004_evidence_base_url = os.getenv("ERC8004_EVIDENCE_BASE_URL", cfg.erc8004_evidence_base_url).strip()
+    cfg.erc8004_private_key = os.getenv("ERC8004_PRIVATE_KEY", cfg.erc8004_private_key).strip()
+    cfg.enable_erc8004_proof = str(os.getenv("ENABLE_ERC8004_PROOF", str(cfg.enable_erc8004_proof))).strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        cfg.erc8004_onchain_min_score = int(os.getenv("ERC8004_ONCHAIN_MIN_SCORE", str(cfg.erc8004_onchain_min_score)).strip())
+    except Exception:
+        cfg.erc8004_onchain_min_score = 90
     try:
         cfg.monthly_mnt_amount = float(os.getenv("MONTHLY_MNT_AMOUNT", str(cfg.monthly_mnt_amount)).strip())
     except Exception:
-        cfg.monthly_mnt_amount = 50.0
+        cfg.monthly_mnt_amount = 5.0
     try:
         cfg.monthly_credit_amount = int(os.getenv("MONTHLY_CREDIT_AMOUNT", str(cfg.monthly_credit_amount)).strip())
     except Exception:
@@ -312,6 +353,20 @@ class AppDB:
                 created_at TEXT
             )
             """)
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS moderation_proofs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proof_hash TEXT UNIQUE,
+                report_json TEXT NOT NULL,
+                action TEXT,
+                chat_hash TEXT,
+                user_hash TEXT,
+                message_hash TEXT,
+                risk_score INTEGER,
+                tx_hash TEXT,
+                created_at TEXT
+            )
+            """)
             self.conn.commit()
 
     def is_seen_news(self, uid: str) -> bool:
@@ -341,6 +396,50 @@ class AppDB:
             c.execute(
                 "INSERT OR IGNORE INTO sent_messages(message_id, created_at) VALUES (?, ?)",
                 (msg_id, datetime.now(timezone.utc).isoformat())
+            )
+            self.conn.commit()
+
+    def save_moderation_proof(
+        self,
+        *,
+        proof_hash: str,
+        report_json: str,
+        action: str,
+        chat_hash: str,
+        user_hash: str,
+        message_hash: str,
+        risk_score: int,
+        tx_hash: str = "",
+    ):
+        with self.lock:
+            c = self.conn.cursor()
+            c.execute(
+                """
+                INSERT OR IGNORE INTO moderation_proofs(
+                    proof_hash, report_json, action, chat_hash, user_hash,
+                    message_hash, risk_score, tx_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proof_hash,
+                    report_json,
+                    action,
+                    chat_hash,
+                    user_hash,
+                    message_hash,
+                    int(risk_score or 0),
+                    tx_hash or "",
+                    datetime.now(timezone.utc).isoformat(),
+                )
+            )
+            self.conn.commit()
+
+    def update_moderation_tx(self, proof_hash: str, tx_hash: str):
+        with self.lock:
+            c = self.conn.cursor()
+            c.execute(
+                "UPDATE moderation_proofs SET tx_hash=? WHERE proof_hash=?",
+                (tx_hash or "", proof_hash)
             )
             self.conn.commit()
 
@@ -387,6 +486,27 @@ def parse_lines(text: str) -> List[str]:
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def canonical_json(data: Dict[str, Any]) -> str:
+    return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def sha256_hex(text: str) -> str:
+    return "0x" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def safe_hash(value: Any, salt: str = "blockscam") -> str:
+    return sha256_hex(f"{salt}:{value}")
+
+
+def redact_message(text: str) -> str:
+    text = text or ""
+    text = re.sub(r"\b\d+(\.\d+)?\s*(usdt|usd|mnt|bnb|eth|btc)\b", "****", text, flags=re.I)
+    text = re.sub(r"@[a-zA-Z0-9_]{3,}", "@***", text)
+    text = re.sub(r"https?://\S+", "https://***", text)
+    text = re.sub(r"t\.me/\S+", "t.me/***", text, flags=re.I)
+    return text[:320]
 
 
 # =========================================================
@@ -1476,7 +1596,12 @@ class TelegramService:
         if not cfg.enable_telegram_social_post:
             return
 
-        targets = parse_lines(cfg.telegram_target_channels)
+        targets = []
+        if getattr(cfg, "telegram_post_channel_url", "").strip():
+            targets.append(cfg.telegram_post_channel_url.strip())
+        targets.extend(parse_lines(cfg.telegram_target_channels))
+        targets = list(dict.fromkeys([x for x in targets if x]))
+
         if not targets:
             logger.info("No Telegram targets configured for social posting.")
             return
@@ -1619,44 +1744,210 @@ class TelegramService:
 
 
 # =========================================================
-# BLOCK SCAM BASIC
+# ERC-8004 BLOCKSCAM PROOF + BLOCK SCAM BASIC
 # =========================================================
 
+class ERC8004ProofService:
+    """Create local moderation evidence and optionally anchor its hash on-chain.
+
+    The Telegram message, user id, and chat id are never written on-chain. The
+    chain transaction only receives a bytes32 proof hash that can later be
+    compared against the local evidence report.
+    """
+
+    VALIDATION_REGISTRY_ABI = [
+        {
+            "type": "function",
+            "name": "validationRequest",
+            "stateMutability": "nonpayable",
+            "inputs": [
+                {"name": "validatorAddress", "type": "address"},
+                {"name": "agentId", "type": "uint256"},
+                {"name": "requestURI", "type": "string"},
+                {"name": "requestHash", "type": "bytes32"},
+            ],
+            "outputs": [],
+        }
+    ]
+
+    def __init__(self, cfg_getter):
+        self.cfg_getter = cfg_getter
+
+    def build_report(
+        self,
+        *,
+        chat: str,
+        message_id: int,
+        sender_id: Any,
+        text: str,
+        action: str,
+        risk_score: int,
+        risk_reason: str,
+        matched_rules: List[str],
+        bot_version: str = "blockscam-telegram-v2",
+    ) -> Tuple[Dict[str, Any], str, str]:
+        cfg = self.cfg_getter()
+        chat_hash = safe_hash(chat, "blockscam-chat")
+        user_hash = safe_hash(sender_id or "unknown", "blockscam-user")
+        message_hash = safe_hash(f"{chat}:{message_id}:{text}", "blockscam-message")
+
+        report = {
+            "type": "telegram_moderation_action",
+            "standard": "ERC-8004-compatible-offchain-evidence",
+            "agentRegistry": getattr(cfg, "erc8004_agent_registry", ""),
+            "agentId": str(getattr(cfg, "erc8004_agent_id", "") or ""),
+            "platform": "telegram",
+            "chatHash": chat_hash,
+            "userHash": user_hash,
+            "messageHash": message_hash,
+            "telegramMessageId": int(message_id),
+            "action": action,
+            "riskScore": int(risk_score or 0),
+            "riskReason": risk_reason,
+            "matchedRules": matched_rules,
+            "originalMessageRedacted": redact_message(text),
+            "botVersion": bot_version,
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+        }
+        report_json = canonical_json(report)
+        proof_hash = sha256_hex(report_json)
+        return report, report_json, proof_hash
+
+    def evidence_uri(self, proof_hash: str) -> str:
+        cfg = self.cfg_getter()
+        base = (getattr(cfg, "erc8004_evidence_base_url", "") or "").strip().rstrip("/")
+        if not base:
+            return ""
+        return f"{base}/proof/{proof_hash}"
+
+    def save_local_proof(self, report: Dict[str, Any], report_json: str, proof_hash: str, tx_hash: str = "") -> None:
+        db.save_moderation_proof(
+            proof_hash=proof_hash,
+            report_json=report_json,
+            action=str(report.get("action") or ""),
+            chat_hash=str(report.get("chatHash") or ""),
+            user_hash=str(report.get("userHash") or ""),
+            message_hash=str(report.get("messageHash") or ""),
+            risk_score=int(report.get("riskScore") or 0),
+            tx_hash=tx_hash or "",
+        )
+
+    def submit_validation_request_if_ready(self, proof_hash: str) -> str:
+        cfg = self.cfg_getter()
+        if not getattr(cfg, "enable_erc8004_proof", False):
+            return ""
+
+        rpc_url = (getattr(cfg, "erc8004_rpc_url", "") or getattr(cfg, "mantle_rpc_url", "") or "").strip()
+        private_key = (getattr(cfg, "erc8004_private_key", "") or "").strip()
+        validation_registry = (getattr(cfg, "erc8004_validation_registry", "") or "").strip()
+        validator_address = (getattr(cfg, "erc8004_validator_address", "") or "").strip()
+        agent_id_raw = (getattr(cfg, "erc8004_agent_id", "") or "").strip()
+
+        if not all([rpc_url, private_key, validation_registry, validator_address, agent_id_raw]):
+            logger.info("ERC-8004 proof is enabled but RPC/private key/validation registry/validator/agent id is missing. Saved local proof only.")
+            return ""
+
+        try:
+            from web3 import Web3
+            from eth_account import Account as EthAccount
+
+            w3 = Web3(Web3.HTTPProvider(rpc_url))
+            if not w3.is_connected():
+                logger.warning("ERC-8004 RPC is not reachable. Saved local proof only.")
+                return ""
+
+            account = EthAccount.from_key(private_key)
+            agent_id = int(agent_id_raw)
+            request_hash_bytes = bytes.fromhex(proof_hash.replace("0x", ""))
+            request_uri = self.evidence_uri(proof_hash)
+
+            contract = w3.eth.contract(
+                address=Web3.to_checksum_address(validation_registry),
+                abi=self.VALIDATION_REGISTRY_ABI,
+            )
+            tx = contract.functions.validationRequest(
+                Web3.to_checksum_address(validator_address),
+                agent_id,
+                request_uri,
+                request_hash_bytes,
+            ).build_transaction({
+                "from": account.address,
+                "nonce": w3.eth.get_transaction_count(account.address),
+                "gas": 260000,
+                "gasPrice": w3.eth.gas_price,
+                "chainId": w3.eth.chain_id,
+            })
+            signed = account.sign_transaction(tx)
+            raw_tx = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
+            tx_hash = w3.eth.send_raw_transaction(raw_tx).hex()
+            logger.info(f"✅ ERC-8004 validationRequest sent: {tx_hash}")
+            return tx_hash
+        except ImportError:
+            logger.warning("web3 is not installed. Add web3 to requirements.txt and redeploy to anchor proofs on-chain.")
+            return ""
+        except Exception as e:
+            logger.warning(f"ERC-8004 validationRequest failed; saved local proof only: {e}")
+            return ""
+
+
 class BlockScamService:
-    def __init__(self, cfg_getter, telegram_service: TelegramService):
+    def __init__(self, cfg_getter, telegram_service: TelegramService, proof_service: Optional[ERC8004ProofService] = None):
         self.cfg_getter = cfg_getter
         self.telegram_service = telegram_service
+        self.proof_service = proof_service or ERC8004ProofService(cfg_getter)
 
     def contains_risky(self, text: str) -> bool:
         return self.rule_based_risk(text)[0]
 
-    def rule_based_risk(self, text: str) -> Tuple[bool, str]:
+    def rule_based_risk(self, text: str) -> Tuple[bool, str, int, List[str]]:
         cfg = self.cfg_getter()
         keys = parse_lines(cfg.block_scam_keywords)
         norm = normalize_text(text)
         compact = re.sub(r"[\s\W_]+", "", norm)
+        matched: List[str] = []
 
         for k in keys:
             nk = normalize_text(k)
             nkc = re.sub(r"[\s\W_]+", "", nk)
             if nk and nk in norm:
-                return True, f"keyword:{k}"
+                matched.append(f"keyword:{k}")
+                continue
             if nkc and nkc in compact:
-                return True, f"keyword:{k}"
+                matched.append(f"keyword:{k}")
+                continue
 
-        if re.search(r"(t\.me\/|joinchat|https?:\/\/)", text or "", re.I):
-            return True, "link_or_invite"
+        strong_patterns = [
+            ("FREE_USDT_LURE", r"(mien phi|miễn phí|free).{0,40}(usdt|usd|mnt|tien|tiền|airdrop|thuong|thưởng)"),
+            ("CONTACT_ME_PATTERN", r"(lien he toi|liên hệ tôi|inbox|ib|pm|dm|nhan tin rieng|nhắn tin riêng)"),
+            ("EARN_MONEY_LURE", r"(kiem|kiếm|nhan|nhận).{0,40}(\d+).{0,20}(usdt|usd|mnt|trieu|triệu)"),
+            ("TELEGRAM_LINK", r"(t\.me/|joinchat|https?://)"),
+            ("URGENT_INVITE", r"(nhanh tay|co hoi|cơ hội|slot|suat|suất|bao loi|bao lời)"),
+        ]
+        for name, pattern in strong_patterns:
+            if re.search(pattern, norm, re.I):
+                matched.append(name)
 
-        return False, "clean_by_rules"
+        matched = list(dict.fromkeys(matched))
+        if not matched:
+            return False, "clean_by_rules", 0, []
 
-    def ai_risk(self, text: str) -> Tuple[bool, str, int]:
+        score = min(100, 55 + len(matched) * 12)
+        matched_set = set(matched)
+        if "FREE_USDT_LURE" in matched_set and ("CONTACT_ME_PATTERN" in matched_set or "TELEGRAM_LINK" in matched_set):
+            score = max(score, 94)
+        if "EARN_MONEY_LURE" in matched_set and ("CONTACT_ME_PATTERN" in matched_set or "TELEGRAM_LINK" in matched_set):
+            score = max(score, 92)
+
+        return score >= 70, ",".join(matched), score, matched
+
+    def ai_risk(self, text: str) -> Tuple[bool, str, int, List[str]]:
         cfg = self.cfg_getter()
         if not getattr(cfg, "enable_block_scam_ai", True):
-            return False, "ai_disabled", 0
+            return False, "ai_disabled", 0, []
         if not (cfg.openai_api_key or os.getenv("OPENAI_API_KEY", "")):
-            return False, "missing_openai_key", 0
+            return False, "missing_openai_key", 0, []
         if len((text or "").strip()) < 8:
-            return False, "too_short", 0
+            return False, "too_short", 0, []
 
         model = getattr(cfg, "block_scam_ai_model", "gpt-5-nano") or "gpt-5-nano"
         threshold = int(getattr(cfg, "block_scam_ai_threshold", 7) or 7)
@@ -1667,6 +1958,7 @@ Classify the message below. Return JSON only with:
 - risk_score: integer 0-10
 - should_delete: boolean
 - reason: short reason
+- matched_rules: array of short rule names
 
 Delete only when the message is likely a scam, phishing attempt, fake support, suspicious investment solicitation, fake airdrop, wallet-draining link, impersonation, paid signal spam, or aggressive unsolicited promotion.
 Do not delete normal discussion, market opinions, genuine questions, or harmless links.
@@ -1680,25 +1972,47 @@ MESSAGE:
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
-                max_completion_tokens=160,
+                max_completion_tokens=180,
             )
             data = json.loads(clean_ai_output(res.choices[0].message.content or "{}"))
-            score = int(data.get("risk_score", 0) or 0)
-            reason = str(data.get("reason", "ai_classified"))[:120]
-            should_delete = bool(data.get("should_delete", False)) or score >= threshold
-            return should_delete, reason, score
+            score_10 = int(data.get("risk_score", 0) or 0)
+            reason = str(data.get("reason", "ai_classified"))[:140]
+            matched = data.get("matched_rules") or []
+            if not isinstance(matched, list):
+                matched = [str(matched)]
+            score = max(0, min(100, score_10 * 10))
+            should_delete = bool(data.get("should_delete", False)) or score_10 >= threshold
+            return should_delete, reason, score, [f"ai:{str(x)[:60]}" for x in matched[:8]]
         except Exception as e:
             logger.warning(f"BlockScam AI check failed: {e}")
-            return False, "ai_error", 0
+            return False, "ai_error", 0, []
 
-    def should_delete_message(self, text: str) -> Tuple[bool, str]:
-        risky, reason = self.rule_based_risk(text)
+    def should_delete_message(self, text: str) -> Tuple[bool, str, int, List[str]]:
+        risky, reason, score, matched = self.rule_based_risk(text)
         if risky:
-            return True, reason
-        ai_delete, ai_reason, ai_score = self.ai_risk(text)
+            return True, reason, score, matched
+        ai_delete, ai_reason, ai_score, ai_matched = self.ai_risk(text)
         if ai_delete:
-            return True, f"ai_score:{ai_score} {ai_reason}"
-        return False, f"allowed ai_score:{ai_score} {ai_reason}"
+            return True, f"ai_score:{ai_score} {ai_reason}", ai_score, ai_matched or ["AI_SCAM_DETECTION"]
+        return False, f"allowed ai_score:{ai_score} {ai_reason}", ai_score, ai_matched
+
+    async def block_sender(self, client: TelegramClient, chat: str, sender_id: Any) -> bool:
+        if not sender_id:
+            logger.warning("No sender_id found, cannot block user.")
+            return False
+        try:
+            await client.edit_permissions(chat, sender_id, view_messages=False)
+            logger.info(f"✅ Blocked user from Telegram chat: {sender_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"edit_permissions block failed: {e}")
+        try:
+            await client.kick_participant(chat, sender_id)
+            logger.info(f"✅ Kicked user from Telegram chat: {sender_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"kick_participant failed: {e}")
+            return False
 
     async def run_basic_monitor(self, stop_event: threading.Event):
         cfg = self.cfg_getter()
@@ -1726,10 +2040,12 @@ MESSAGE:
             await client.disconnect()
             return
 
-        logger.info("🛡️ BlockScam monitor started with keyword rules and optional AI classification.")
+        logger.info("🛡️ BlockScam monitor started with moderation proof support.")
 
         while not stop_event.is_set():
             try:
+                cfg = self.cfg_getter()
+                min_onchain_score = int(getattr(cfg, "erc8004_onchain_min_score", 90) or 90)
                 for chat in chats:
                     try:
                         messages = await client.get_messages(chat, limit=30)
@@ -1739,7 +2055,6 @@ MESSAGE:
                                 continue
 
                             text = msg.text or ""
-
                             if not text:
                                 continue
 
@@ -1749,15 +2064,54 @@ MESSAGE:
 
                             db.mark_sent_message(key)
 
-                            should_delete, risk_reason = self.should_delete_message(text)
-                            if should_delete:
-                                logger.warning(f"🚫 Suspicious scam in {chat}: {risk_reason} | {text[:80]}")
+                            should_delete, risk_reason, risk_score, matched_rules = self.should_delete_message(text)
+                            if not should_delete:
+                                continue
 
-                                try:
-                                    await client.delete_messages(chat, msg.id)
-                                    logger.info("✅ Scam message deleted.")
-                                except Exception as e:
-                                    logger.warning(f"Could not delete message: {e}")
+                            logger.warning(f"🚫 Suspicious scam in {chat}: score={risk_score} reason={risk_reason} | {text[:100]}")
+
+                            action = "detect_only"
+                            deleted = False
+                            blocked = False
+                            sender_id = getattr(msg, "sender_id", None)
+
+                            try:
+                                await client.delete_messages(chat, msg.id)
+                                deleted = True
+                                action = "delete_message"
+                                logger.info("✅ Scam message deleted.")
+                            except Exception as e:
+                                logger.warning(f"Could not delete message: {e}")
+
+                            if risk_score >= min_onchain_score:
+                                blocked = await self.block_sender(client, chat, sender_id)
+                                if blocked and deleted:
+                                    action = "delete_message_and_block_user"
+                                elif blocked:
+                                    action = "block_user"
+                                elif deleted:
+                                    action = "delete_message_block_failed"
+
+                            try:
+                                report, report_json, proof_hash = self.proof_service.build_report(
+                                    chat=str(chat),
+                                    message_id=int(msg.id),
+                                    sender_id=sender_id,
+                                    text=text,
+                                    action=action,
+                                    risk_score=int(risk_score or 0),
+                                    risk_reason=risk_reason,
+                                    matched_rules=matched_rules,
+                                )
+                                tx_hash = ""
+                                if risk_score >= min_onchain_score:
+                                    tx_hash = self.proof_service.submit_validation_request_if_ready(proof_hash)
+                                self.proof_service.save_local_proof(report, report_json, proof_hash, tx_hash)
+                                if tx_hash:
+                                    db.update_moderation_tx(proof_hash, tx_hash)
+                                logger.info(f"🧾 BlockScam proof created | score={risk_score} | hash={proof_hash} | tx={tx_hash or 'local-only'}")
+                            except Exception as e:
+                                logger.warning(f"Could not create BlockScam proof: {e}")
 
                     except Exception as e:
                         logger.error(f"BlockScam chat error {chat}: {e}")
