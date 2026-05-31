@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
+from urllib.parse import urlparse, urlunparse
 
 import requests
 import feedparser
@@ -1659,6 +1660,288 @@ class PlaywrightSocialService:
         logger.warning(f"Could not attach generated image to {platform}; posting text only.")
         return False
 
+    def _facebook_target_variants(self, target: str) -> List[str]:
+        """Return desktop/mobile/basic Facebook URL variants for browser posting.
+
+        The regular Facebook desktop composer is React-heavy and changes often.
+        Mobile/basic pages are simpler and can expose stable textarea/form names
+        such as xc_message/view_post on some profile/group surfaces.
+        """
+        raw = (target or "").strip() or "https://www.facebook.com/"
+        if not raw.startswith(("http://", "https://")):
+            raw = "https://" + raw
+
+        out: List[str] = []
+
+        def add(url: str):
+            if url and url not in out:
+                out.append(url)
+
+        add(raw)
+        try:
+            parsed = urlparse(raw)
+            host = (parsed.netloc or "").lower()
+            if "facebook.com" in host:
+                path = parsed.path or "/"
+                query = parsed.query or ""
+                for mobile_host in ["m.facebook.com", "mbasic.facebook.com", "www.facebook.com"]:
+                    add(urlunparse((parsed.scheme or "https", mobile_host, path, "", query, "")))
+        except Exception:
+            pass
+
+        return out
+
+    async def _save_facebook_debug_artifacts(self, page, label: str = "facebook") -> None:
+        """Save a screenshot/HTML snapshot to runtime for debugging failed Facebook UI changes."""
+        try:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            safe_label = re.sub(r"[^a-zA-Z0-9_-]+", "_", label)[:40] or "facebook"
+            png_path = RUNTIME_DIR / f"{safe_label}_debug_{stamp}.png"
+            html_path = RUNTIME_DIR / f"{safe_label}_debug_{stamp}.html"
+            await page.screenshot(path=str(png_path), full_page=True)
+            html_path.write_text(await page.content(), encoding="utf-8", errors="ignore")
+            logger.warning(f"Saved Facebook debug snapshot: {png_path.name}, {html_path.name}")
+        except Exception as e:
+            logger.warning(f"Could not save Facebook debug snapshot: {e}")
+
+    async def _find_visible_locator(self, page, selectors: List[str], *, timeout: int = 1500, prefer_last: bool = False):
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                count = await loc.count()
+                if count <= 0:
+                    try:
+                        await loc.first.wait_for(timeout=timeout)
+                        count = await loc.count()
+                    except Exception:
+                        continue
+
+                indexes = range(count - 1, -1, -1) if prefer_last else range(count)
+                for idx in indexes:
+                    candidate = loc.nth(idx)
+                    try:
+                        if await candidate.is_visible():
+                            return candidate
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return None
+
+    async def _fill_facebook_box(self, page, box, text: str) -> None:
+        await box.click()
+        try:
+            tag = (await box.evaluate("el => (el.tagName || '').toLowerCase()")) or ""
+        except Exception:
+            tag = ""
+
+        if tag in {"textarea", "input"}:
+            try:
+                await box.fill(text)
+                return
+            except Exception:
+                pass
+
+        try:
+            await page.keyboard.insert_text(text)
+        except Exception:
+            await box.press_sequentially(text, delay=4)
+
+    async def _post_facebook_basic_or_mobile(self, context, text: str, image_path: str | None, target: str) -> bool:
+        """Post through mobile/basic Facebook as a non-API fallback.
+
+        This path avoids the desktop React composer when possible. It still uses
+        the user's logged-in browser/cookies and only succeeds when Facebook
+        exposes a normal posting form on the chosen target surface.
+        """
+        page = await context.new_page()
+        try:
+            targets = [u for u in self._facebook_target_variants(target) if "mbasic.facebook.com" in u or "m.facebook.com" in u]
+            if not targets:
+                targets = self._facebook_target_variants(target)
+
+            for url in targets:
+                logger.info(f"📘 Trying Facebook mobile/basic fallback: {url}")
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+                    await page.wait_for_timeout(4500)
+                except Exception as e:
+                    logger.warning(f"Facebook mobile/basic page open failed for {url}: {e}")
+                    continue
+
+                current_url = page.url.lower()
+                if "login" in current_url or "checkpoint" in current_url:
+                    raise RuntimeError("Facebook is not logged in, cookies expired, or the account is checkpointed. Paste Facebook Cookie JSON again on the dashboard, then click Save.")
+
+                # Some mobile/basic pages show a separate 'Write something' link/button first.
+                trigger_selectors = [
+                    'a:has-text("Write something")',
+                    'a:has-text("What\'s on your mind")',
+                    'a:has-text("Create Post")',
+                    'a:has-text("Create a post")',
+                    'a:has-text("Tạo bài viết")',
+                    'a:has-text("Bạn đang nghĩ gì")',
+                    'a[href*="composer"]',
+                    'a[href*="mbasic_inline_feed_composer"]',
+                    'button:has-text("Write something")',
+                    'button:has-text("Create Post")',
+                    'button:has-text("Tạo bài viết")',
+                ]
+                trigger = await self._find_visible_locator(page, trigger_selectors, timeout=1200)
+                if trigger:
+                    try:
+                        await trigger.click()
+                        await page.wait_for_timeout(3500)
+                    except Exception:
+                        pass
+
+                textarea_selectors = [
+                    'textarea[name="xc_message"]',
+                    'textarea[name="status"]',
+                    'textarea[name="message"]',
+                    'textarea[name*="message"]',
+                    'textarea',
+                    '[contenteditable="true"]',
+                    '[role="textbox"]',
+                ]
+                box = await self._find_visible_locator(page, textarea_selectors, timeout=2500, prefer_last=False)
+                if not box:
+                    continue
+
+                await self._fill_facebook_box(page, box, text)
+                await page.wait_for_timeout(800)
+
+                # Image upload on m/mbasic is best-effort. Many Facebook surfaces hide it.
+                await self._attach_image_if_possible(page, image_path, platform="Facebook mobile/basic")
+
+                submit_selectors = [
+                    'input[name="view_post"]',
+                    'button[name="view_post"]',
+                    'input[type="submit"][value="Post"]',
+                    'input[type="submit"][value="Đăng"]',
+                    'button:has-text("Post")',
+                    'button:has-text("Đăng")',
+                    'input[type="submit"]',
+                ]
+
+                submit = await self._find_visible_locator(page, submit_selectors, timeout=2000, prefer_last=True)
+                if not submit:
+                    continue
+
+                before_url = page.url
+                await submit.click()
+                await page.wait_for_timeout(6000)
+
+                # Basic Facebook may show a second confirmation screen. Click one more clear submit if present.
+                second_submit = await self._find_visible_locator(page, submit_selectors, timeout=1200, prefer_last=True)
+                if second_submit:
+                    try:
+                        await second_submit.click()
+                        await page.wait_for_timeout(5000)
+                    except Exception:
+                        pass
+
+                if page.url != before_url or not await self._find_visible_locator(page, textarea_selectors, timeout=800, prefer_last=False):
+                    logger.info("✅ Posted to Facebook through mobile/basic fallback.")
+                    return True
+
+            return False
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+    async def _post_facebook_desktop(self, page, text: str, image_path: str | None, target: str) -> bool:
+        """Post through the standard desktop composer with broader selectors."""
+        await page.goto(target, wait_until="domcontentloaded", timeout=90000)
+        await page.wait_for_timeout(6000)
+
+        current_url = page.url.lower()
+        if "login" in current_url or "checkpoint" in current_url:
+            raise RuntimeError("Facebook is not logged in, cookies expired, or the account is checkpointed. Paste Facebook Cookie JSON again on the dashboard, then click Save.")
+
+        composer_triggers = [
+            'div[role="button"]:has-text("What\'s on your mind")',
+            'span:has-text("What\'s on your mind")',
+            'div[role="button"]:has-text("Write something")',
+            'span:has-text("Write something")',
+            'div[role="button"]:has-text("Create post")',
+            'span:has-text("Create post")',
+            'div[role="button"]:has-text("Bạn đang nghĩ gì")',
+            'span:has-text("Bạn đang nghĩ gì")',
+            'div[role="button"]:has-text("Tạo bài viết")',
+            'span:has-text("Tạo bài viết")',
+            'div[role="button"]:has-text("Viết gì đó")',
+            'span:has-text("Viết gì đó")',
+            'div[aria-label*="Create a post" i]',
+            'div[aria-label*="Create post" i]',
+            'div[aria-label*="Tạo bài viết" i]',
+            'div[role="button"][aria-label*="post" i]',
+            'div[role="button"][aria-label*="đăng" i]',
+            '[data-pagelet*="Composer"] div[role="button"]',
+        ]
+
+        opened = False
+        trigger = await self._find_visible_locator(page, composer_triggers, timeout=1800, prefer_last=False)
+        if trigger:
+            try:
+                await trigger.click()
+                opened = True
+            except Exception:
+                pass
+
+        if not opened:
+            logger.warning("Could not find a clear composer button, trying direct input detection...")
+
+        await page.wait_for_timeout(3500)
+
+        textboxes = [
+            'div[role="dialog"] div[role="textbox"][contenteditable="true"]',
+            'div[role="dialog"] div[contenteditable="true"]',
+            'div[role="textbox"][contenteditable="true"]',
+            'div[contenteditable="true"][aria-label*="What" i]',
+            'div[contenteditable="true"][aria-label*="mind" i]',
+            'div[contenteditable="true"][aria-label*="Bạn" i]',
+            'div[contenteditable="true"][aria-label*="Viết" i]',
+            'div[contenteditable="true"]',
+            'textarea',
+        ]
+
+        box = await self._find_visible_locator(page, textboxes, timeout=2500, prefer_last=True)
+        if not box:
+            return False
+
+        await self._fill_facebook_box(page, box, text)
+        await page.wait_for_timeout(1200)
+        await self._attach_image_if_possible(page, image_path, platform="Facebook")
+
+        post_buttons = [
+            'div[role="dialog"] div[aria-label="Post"][role="button"]',
+            'div[role="dialog"] div[aria-label="Đăng"][role="button"]',
+            'div[role="dialog"] div[aria-label*="Post" i][role="button"]',
+            'div[role="dialog"] div[aria-label*="Đăng" i][role="button"]',
+            'div[role="dialog"] div[aria-label*="Publish" i][role="button"]',
+            'div[role="dialog"] div[role="button"]:has-text("Post")',
+            'div[role="dialog"] div[role="button"]:has-text("Đăng")',
+            'div[role="dialog"] [role="button"]:has-text("Publish")',
+            'div[role="dialog"] [role="button"]:has-text("Share")',
+            'div[aria-label="Post"][role="button"]',
+            'div[aria-label="Đăng"][role="button"]',
+            'div[aria-label*="Post" i][role="button"]',
+            'div[aria-label*="Đăng" i][role="button"]',
+        ]
+
+        clicked = await self._try_click_or_shortcut(page, post_buttons, platform="Facebook", timeout=10000, allow_shortcut=False)
+        if not clicked:
+            return False
+
+        if not await self._confirm_facebook_publish(page):
+            return False
+
+        logger.info("✅ Posted to Facebook and composer closed.")
+        return True
+
     async def post_x(self, text: str, image_path: str | None = None):
         cfg = self.cfg_getter()
         if not cfg.enable_x_post:
@@ -1750,7 +2033,6 @@ class PlaywrightSocialService:
             return
 
         target = cfg.facebook_target_url.strip() or "https://www.facebook.com/"
-
         logger.info("📘 Posting to Facebook with Playwright browser fallback...")
 
         async with async_playwright() as p:
@@ -1764,91 +2046,31 @@ class PlaywrightSocialService:
             )
 
             await self.add_facebook_cookies_if_any(context)
-
             page = context.pages[0] if context.pages else await context.new_page()
 
             try:
-                await page.goto(target, wait_until="domcontentloaded", timeout=90000)
-                await page.wait_for_timeout(6000)
+                # The most stable non-API path is mobile/basic first because it
+                # often exposes normal textarea/form elements. If that surface is
+                # unavailable for the target, fall back to the desktop composer.
+                mobile_ok = await self._post_facebook_basic_or_mobile(context, text, image_path, target)
+                if mobile_ok:
+                    return
 
-                current_url = page.url.lower()
-                if "login" in current_url or "checkpoint" in current_url:
-                    raise RuntimeError("Facebook is not logged in, cookies expired, or the account is checkpointed. Paste Facebook Cookie JSON again on the dashboard, then click Save.")
+                logger.info("📘 Mobile/basic Facebook fallback did not expose a posting form; trying desktop composer...")
+                desktop_ok = await self._post_facebook_desktop(page, text, image_path, target)
+                if desktop_ok:
+                    return
 
-                composer_triggers = [
-                    "div[role=\"button\"]:has-text(\"What\'s on your mind\")",
-                    'div[role="button"]:has-text("Bạn đang nghĩ gì")',
-                    "span:has-text(\"What\'s on your mind\")",
-                    'span:has-text("Bạn đang nghĩ gì")',
-                    'div[aria-label*="Create a post"]',
-                    'div[aria-label*="Tạo bài viết"]',
-                    'div[role="button"][aria-label*="post" i]',
-                ]
-
-                opened = False
-                for sel in composer_triggers:
-                    try:
-                        loc = page.locator(sel).first
-                        await loc.wait_for(timeout=7000)
-                        await loc.click()
-                        opened = True
-                        break
-                    except Exception:
-                        pass
-
-                if not opened:
-                    logger.warning("Could not find a clear composer button, trying direct input detection...")
-
-                await page.wait_for_timeout(3000)
-
-                textboxes = [
-                    'div[role="textbox"][contenteditable="true"]',
-                    'div[role="textbox"]',
-                    "div[aria-label*=\"What\'s on your mind\"]",
-                    'div[aria-label*="Bạn đang nghĩ gì"]'
-                ]
-
-                box = None
-                for sel in textboxes:
-                    try:
-                        loc = page.locator(sel).last
-                        await loc.wait_for(timeout=10000)
-                        box = loc
-                        break
-                    except Exception:
-                        pass
-
-                if not box:
-                    raise RuntimeError("Could not find the Facebook input box. Log in again or check whether the Target URL is the correct profile/page/group.")
-
-                await box.click()
-                await page.keyboard.insert_text(text)
-                await page.wait_for_timeout(1000)
-                await self._attach_image_if_possible(page, image_path, platform="Facebook")
-
-                post_buttons = [
-                    'div[role="dialog"] div[aria-label="Post"][role="button"]',
-                    'div[role="dialog"] div[aria-label="Đăng"][role="button"]',
-                    'div[role="dialog"] div[aria-label*="Post"][role="button"]',
-                    'div[role="dialog"] div[aria-label*="Đăng"][role="button"]',
-                    'div[role="dialog"] div[role="button"]:has-text("Post")',
-                    'div[role="dialog"] div[role="button"]:has-text("Đăng")',
-                    'div[aria-label="Post"][role="button"]',
-                    'div[aria-label="Đăng"][role="button"]',
-                ]
-
-                clicked = await self._try_click_or_shortcut(page, post_buttons, platform="Facebook", timeout=10000, allow_shortcut=False)
-
-                if not clicked:
-                    raise RuntimeError("Could not find a real Facebook Post button. Facebook browser posting was not confirmed. Re-check Cookie JSON/Target URL, or use Facebook Page Graph API for reliable posting.")
-
-                if not await self._confirm_facebook_publish(page):
-                    raise RuntimeError("Facebook publish was clicked but not confirmed. The composer stayed open, so the post may not have been published. Check whether Facebook asked for extra confirmation, captcha, account checkpoint, or media upload review.")
-
-                logger.info("✅ Posted to Facebook and composer closed.")
+                await self._save_facebook_debug_artifacts(page, "facebook_post_failed")
+                raise RuntimeError(
+                    "Could not find a reliable Facebook composer/input/post button. "
+                    "Check that the Facebook Target URL is a profile/page/group where this account can post, "
+                    "refresh Facebook Cookie JSON, or open the Facebook login browser once to save a persistent session."
+                )
 
             finally:
                 await context.close()
+
 
 # =========================================================
 # TELEGRAM SERVICE
