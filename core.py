@@ -1862,8 +1862,11 @@ class PlaywrightSocialService:
             marked = await page.evaluate(
                 """
                 ({ requireDialog }) => {
-                  const previous = document.querySelectorAll('[data-msp-facebook-composer="1"]');
-                  previous.forEach(el => el.removeAttribute('data-msp-facebook-composer'));
+                  const previous = document.querySelectorAll('[data-msp-facebook-composer="1"],[data-msp-facebook-composer-root="1"]');
+                  previous.forEach(el => {
+                    el.removeAttribute('data-msp-facebook-composer');
+                    el.removeAttribute('data-msp-facebook-composer-root');
+                  });
 
                   const visible = (el) => {
                     if (!el || !el.isConnected) return false;
@@ -1951,7 +1954,30 @@ class PlaywrightSocialService:
                   }
 
                   if (!best) return false;
+
+                  const chooseRoot = (el) => {
+                    if (activeDialog) return activeDialog;
+                    const form = el.closest('form');
+                    if (form) return form;
+                    const composer = el.closest('[data-pagelet*="Composer"],[aria-label*="Create post"],[aria-label*="Tạo bài viết"]');
+                    if (composer) return composer;
+                    let cur = el;
+                    let chosen = el.parentElement || el;
+                    for (let i = 0; cur && i < 8; i++, cur = cur.parentElement) {
+                      if (!visible(cur)) continue;
+                      const r = cur.getBoundingClientRect();
+                      const txt = norm([cur.getAttribute('aria-label'), cur.innerText, cur.textContent].filter(Boolean).join(' '));
+                      // Keep the root near the composer. Do not climb to the whole feed/page.
+                      if (r.width >= 260 && r.height >= 35 && r.height <= 800 && hasAny(txt, composerNeedles) && !hasAny(txt, rejectNeedles)) {
+                        chosen = cur;
+                      }
+                    }
+                    return chosen;
+                  };
+
                   best.setAttribute('data-msp-facebook-composer', '1');
+                  const root = chooseRoot(best);
+                  if (root) root.setAttribute('data-msp-facebook-composer-root', '1');
                   best.scrollIntoView({block:'center', inline:'center'});
                   best.click();
                   return true;
@@ -1967,8 +1993,13 @@ class PlaywrightSocialService:
             pass
         return None
 
-    async def _facebook_click_publish_button(self, page, *, require_dialog: bool = False) -> bool:
-        """Click the real Facebook publish button, not a comment/reply button."""
+    async def _facebook_click_publish_button(self, page, *, require_dialog: bool = False, safe_root_only: bool = False) -> bool:
+        """Click the real Facebook publish button, not a comment/reply button.
+
+        For desktop inline composers we only click inside the composer root that
+        was marked by _facebook_find_composer_box. This avoids accidentally
+        pressing a comment/reply submit button elsewhere on the page.
+        """
         selectors = []
         if require_dialog:
             selectors.extend([
@@ -2231,14 +2262,24 @@ class PlaywrightSocialService:
 
         await page.wait_for_timeout(3500)
 
-        # Desktop Facebook has many comment boxes in the feed. To avoid posting
-        # into a comment, require the create-post dialog after clicking the
-        # composer trigger. If the dialog does not open, fail safely and save a
-        # debug snapshot instead of typing into a random textbox.
+        # Desktop Facebook has many comment boxes in the feed. Prefer a real
+        # create-post dialog. Some Page/profile layouts, however, expose a
+        # trusted inline composer with text like "Bạn đang nghĩ gì" and do not
+        # open a dialog. In that case we allow only that marked composer root
+        # and refuse all generic textboxes, so the bot cannot comment on a post.
+        used_dialog = True
         box = await self._facebook_find_composer_box(page, require_dialog=True)
         if not box:
             logger.warning(
                 f"Facebook desktop: create-post dialog/input not found after composer click. "
+                f"Trying trusted inline composer only. title={await page.title()} url={page.url}"
+            )
+            used_dialog = False
+            box = await self._facebook_find_composer_box(page, require_dialog=False)
+
+        if not box:
+            logger.warning(
+                f"Facebook desktop: no trusted create-post composer found. "
                 f"Refusing to use generic textboxes to avoid commenting on a post. "
                 f"title={await page.title()} url={page.url}"
             )
@@ -2248,9 +2289,9 @@ class PlaywrightSocialService:
         await page.wait_for_timeout(1200)
         await self._attach_image_if_possible(page, image_path, platform="Facebook")
 
-        clicked = await self._facebook_click_publish_button(page, require_dialog=True)
+        clicked = await self._facebook_click_publish_button(page, require_dialog=used_dialog, safe_root_only=(not used_dialog))
         if not clicked:
-            logger.warning("Facebook desktop: composer input was filled but no reliable Post/Đăng button was found.")
+            logger.warning("Facebook desktop: composer input was filled but no reliable Post/Đăng button was found inside the trusted composer.")
             return False
 
         if not await self._confirm_facebook_publish(page):
