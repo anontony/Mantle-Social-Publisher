@@ -418,10 +418,11 @@ The bot does not put raw Telegram IDs, full usernames, full group names, or full
 
 ERC-8004 proof anchoring is optional. Local proof storage works even without on-chain configuration.
 
-### 9.1 Environment variables
+For public deployments, the project owner configures the shared BlockScam Agent and Validation Registry once. Users only provide a fresh low-balance Proof Writer wallet in the dashboard when they want on-chain proof submission.
+
+### 9.1 Project-level environment variables
 
 ```env
-ENABLE_ERC8004_PROOF=1
 ERC8004_RPC_URL=https://rpc.mantle.xyz
 ERC8004_AGENT_REGISTRY=0x8004A169FB4a3325136EB29fA0ceB6D2e539a432
 ERC8004_REPUTATION_REGISTRY=0x8004BAa17C55a88189AE136b182e5fdA19dE9b63
@@ -429,13 +430,19 @@ ERC8004_VALIDATION_REGISTRY=0xYourValidationRegistry
 ERC8004_VALIDATOR_ADDRESS=0xYourValidatorAddress
 ERC8004_AGENT_ID=YourAgentId
 ERC8004_EVIDENCE_BASE_URL=https://your-railway-domain.up.railway.app
-ERC8004_PRIVATE_KEY=0xProofWriterPrivateKey
 ERC8004_ONCHAIN_MIN_SCORE=90
 ```
 
-### 9.2 Agent identity
+Leave `ERC8004_PRIVATE_KEY` empty in Railway for public deployments. Each user can save their own fresh Proof Writer private key inside the BlockScam dashboard. The wallet should only contain a small amount of MNT for gas.
 
-Register a BlockScam agent in the ERC-8004 Identity Registry and save the returned `agentId`.
+### 9.2 Register the BlockScam Agent
+
+```bash
+npm run compile
+npm run register:agent
+```
+
+Copy the printed `ERC8004_AGENT_ID` into Railway.
 
 The evidence report binds moderation proof to:
 
@@ -445,20 +452,19 @@ agentRegistry + agentId + proofHash
 
 ### 9.3 Validation Registry and Validator
 
+Deploy the lightweight validation registry included in this repository:
+
+```bash
+npm run deploy:validation
+```
+
+Copy the deployed address into `ERC8004_VALIDATION_REGISTRY`. For a demo, `ERC8004_VALIDATOR_ADDRESS` can be a fresh validator wallet or the same low-balance wallet used for proof writing.
+
 The app calls:
 
 ```solidity
 validationRequest(validatorAddress, agentId, requestURI, requestHash)
 ```
-
-You must provide:
-
-- `ERC8004_VALIDATION_REGISTRY`
-- `ERC8004_VALIDATOR_ADDRESS`
-- `ERC8004_AGENT_ID`
-- `ERC8004_PRIVATE_KEY`
-
-`ERC8004_PRIVATE_KEY` should be a dedicated proof-writer wallet with only enough MNT for gas. Do not use the treasury wallet or a wallet holding major funds.
 
 ### 9.4 Proof endpoints
 
@@ -586,7 +592,7 @@ ERC8004_AGENT_REGISTRY=0x8004A169FB4a3325136EB29fA0ceB6D2e539a432
 ERC8004_REPUTATION_REGISTRY=0x8004BAa17C55a88189AE136b182e5fdA19dE9b63
 ERC8004_VALIDATION_REGISTRY=0xYourValidationRegistry
 ERC8004_VALIDATOR_ADDRESS=0xYourValidatorAddress
-ERC8004_AGENT_ID=1
+ERC8004_AGENT_ID=YourAgentId
 ERC8004_EVIDENCE_BASE_URL=https://your-app.up.railway.app
 ERC8004_ONCHAIN_MIN_SCORE=90
 ```
