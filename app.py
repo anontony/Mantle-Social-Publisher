@@ -38,6 +38,7 @@ from core import (
     apply_server_subscription_settings,
     set_log_context,
     clear_log_context,
+    cleanup_generated_media,
 )
 
 app = FastAPI(title=APP_NAME)
@@ -825,11 +826,17 @@ async def publish_socials(summary: str, image_path: str = "", image_url: str = "
     if cfg.enable_facebook_post:
         tasks.append(social_service.post_facebook(summary, image_path, image_url))
 
-    for task in tasks:
-        try:
-            await task
-        except Exception as e:
-            logger.error(f"Social posting error: {e}")
+    try:
+        for task in tasks:
+            try:
+                await task
+            except Exception as e:
+                logger.error(f"Social posting error: {e}")
+    finally:
+        # The generated PNG is only needed while social posting is in progress.
+        # Deleting it here keeps Railway Volume small without touching app.db,
+        # Telegram sessions, browser profiles, or user workspace config.
+        cleanup_generated_media(image_path)
 
 
 def seconds_between_posts(c: AppConfig) -> int:
@@ -875,11 +882,17 @@ async def publish_socials_for_state(summary: str, state: dict[str, Any], image_p
         tasks.append(state["social"].post_x(summary, image_path))
     if c.enable_facebook_post:
         tasks.append(state["social"].post_facebook(summary, image_path, image_url))
-    for task in tasks:
-        try:
-            await task
-        except Exception as e:
-            logger.error(f"Social posting error: {e}")
+    try:
+        for task in tasks:
+            try:
+                await task
+            except Exception as e:
+                logger.error(f"Social posting error: {e}")
+    finally:
+        # The generated PNG is only needed while social posting is in progress.
+        # Deleting it here keeps Railway Volume small without touching app.db,
+        # Telegram sessions, browser profiles, or user workspace config.
+        cleanup_generated_media(image_path)
 
 
 def bot_worker_for_user(address: str, stop_evt: threading.Event):
@@ -1993,6 +2006,7 @@ def home_content() -> str:
     <form method="post" action="/stop"><button class="danger">Stop Bot</button></form>
     <form method="post" action="/post-once"><button class="primary">Write & Publish Now</button></form>
     <form method="post" action="/scan"><button>Scan RSS</button></form>
+    <form method="post" action="/cleanup-images"><button>Clean Generated Images</button></form>
   </div>
 </div>
 <div class="card">
@@ -2494,6 +2508,7 @@ def home(request: Request, tab: str = "home", msg: str = ""):
         "subrequired": "Monthly subscription required before using this feature.",
         "loginrequired": "Connect your wallet before saving workspace settings.",
         "prooftest": "Test proof started. Check the workspace logs and View Proofs for the result.",
+        "cleanup": "Temporary generated images cleaned. User config was not touched.",
     }
     message = message_map.get(msg, "")
     if tab == "profile":
@@ -2591,6 +2606,17 @@ def scan(request: Request):
 
     threading.Thread(target=worker, daemon=True).start()
     return RedirectResponse("/?tab=wordpress", status_code=303)
+
+
+@app.post("/cleanup-images")
+def cleanup_images(request: Request):
+    user, guard = require_active_user(request)
+    if guard: return guard
+    address = normalize_address(user["address"])
+    result = cleanup_generated_media(force=True)
+    freed_mb = (result.get("freed_bytes", 0) or 0) / 1024 / 1024
+    log_info_for_user(address, f"🧹 Cleaned temporary generated images: deleted={result.get('deleted', 0)}, freed={freed_mb:.2f} MB. User config was not touched.")
+    return RedirectResponse("/?tab=home&msg=cleanup", status_code=303)
 
 
 @app.post("/post-once")

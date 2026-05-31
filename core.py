@@ -85,6 +85,124 @@ for p in [RUNTIME_DIR, SESSION_DIR, PROFILE_DIR, SOCIAL_IMAGE_DIR]:
     p.mkdir(parents=True, exist_ok=True)
 
 
+# Local generated social images are temporary. WordPress keeps the uploaded
+# media by media_id/source_url, so keeping duplicate PNG files in Railway
+# Volume only wastes storage. User config, sessions and proofs are stored in
+# different files/directories and are never touched by this cleanup.
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+def _path_is_inside(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:
+        return False
+
+def _unlink_file(path: Path) -> bool:
+    try:
+        if path.exists() and path.is_file():
+            path.unlink()
+            return True
+    except Exception as e:
+        logger.warning(f"Cleanup could not delete {path}: {e}")
+    return False
+
+def cleanup_generated_media(image_path: str | None = None, *, force: bool = False) -> dict:
+    """Delete temporary generated media without touching user config.
+
+    Safe scope:
+    - generated social images in RUNTIME_DIR/social_images
+    - old Facebook debug snapshots in RUNTIME_DIR
+
+    Never deletes:
+    - app.db
+    - sessions/
+    - browser_profiles/
+    - proof JSON files
+    - user config
+    """
+    deleted = 0
+    freed = 0
+
+    auto_delete_after_post = env_bool("SOCIAL_IMAGE_DELETE_AFTER_POST", True)
+    retention_hours = max(0.0, _float_env("SOCIAL_IMAGE_RETENTION_HOURS", 6.0))
+    max_total_mb = max(0.0, _float_env("SOCIAL_IMAGE_MAX_TOTAL_MB", 256.0))
+    debug_retention_hours = max(1.0, _float_env("DEBUG_SNAPSHOT_RETENTION_HOURS", 24.0))
+    now = time.time()
+
+    def delete_one(path: Path) -> None:
+        nonlocal deleted, freed
+        try:
+            size = path.stat().st_size if path.exists() else 0
+        except Exception:
+            size = 0
+        if _unlink_file(path):
+            deleted += 1
+            freed += size
+
+    # Delete the exact image used for the just-finished social posting attempt.
+    # This is the biggest storage saver because one generated image can be MBs.
+    if image_path and (force or auto_delete_after_post):
+        path = Path(str(image_path))
+        if _path_is_inside(path, SOCIAL_IMAGE_DIR) and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+            delete_one(path)
+
+    # Crash/redeploy safety: delete stale generated social images that were not
+    # removed after a posting attempt.
+    try:
+        stale_before = now - retention_hours * 3600
+        image_files = [p for p in SOCIAL_IMAGE_DIR.glob("*") if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}]
+        for path in image_files:
+            try:
+                if force or path.stat().st_mtime < stale_before:
+                    delete_one(path)
+            except Exception:
+                continue
+
+        # Optional cap by total size. If the folder is still too large, remove
+        # the oldest images first.
+        remaining = [p for p in SOCIAL_IMAGE_DIR.glob("*") if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}]
+        total = sum((p.stat().st_size for p in remaining if p.exists()), 0)
+        limit = int(max_total_mb * 1024 * 1024)
+        if limit > 0 and total > limit:
+            for path in sorted(remaining, key=lambda x: x.stat().st_mtime if x.exists() else 0):
+                if total <= limit:
+                    break
+                try:
+                    size = path.stat().st_size
+                except Exception:
+                    size = 0
+                delete_one(path)
+                total -= size
+    except Exception as e:
+        logger.warning(f"Generated image cleanup failed: {e}")
+
+    # Facebook debug snapshots are useful only shortly after a failure. Keep them
+    # out of long-term volume growth too.
+    try:
+        debug_stale_before = now - debug_retention_hours * 3600
+        for path in RUNTIME_DIR.glob("facebook_post_failed_debug_*"):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in {".png", ".html"}:
+                continue
+            try:
+                if force or path.stat().st_mtime < debug_stale_before:
+                    delete_one(path)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"Debug snapshot cleanup failed: {e}")
+
+    if deleted:
+        logger.info(f"🧹 Runtime cleanup deleted {deleted} temporary file(s), freed {freed / 1024 / 1024:.2f} MB.")
+    return {"deleted": deleted, "freed_bytes": freed}
+
+
 # =========================================================
 # RSS FEEDS
 # =========================================================
@@ -1539,12 +1657,121 @@ class PlaywrightSocialService:
         logger.info("✅ Posted to X via API.")
         return r.json()
 
+    def _facebook_graph_url(self, version: str, path: str) -> str:
+        path = str(path).lstrip("/")
+        return f"https://graph.facebook.com/{version}/{path}"
+
+    def _facebook_get_json(self, version: str, path: str, token: str, params: dict | None = None, timeout: int = 30) -> dict:
+        payload = dict(params or {})
+        payload["access_token"] = token
+        r = requests.get(self._facebook_graph_url(version, path), params=payload, timeout=timeout)
+        if r.status_code not in (200, 201):
+            raise RuntimeError(f"Facebook Graph API verify failed: HTTP {r.status_code} | {r.text[:500]}")
+        try:
+            return r.json()
+        except Exception:
+            raise RuntimeError(f"Facebook Graph API returned non-JSON verify response: {r.text[:300]}")
+
+    def _facebook_verify_publish(self, version: str, page_id: str, token: str, result: dict, *, had_image: bool) -> dict:
+        """Verify that Meta created a visible Page object and log the real URL.
+
+        A 200 response from /photos can return a photo id. Depending on the Page
+        experience, admins may not immediately see it on the main timeline. This
+        method tries to resolve the returned object to a Page post permalink so
+        the dashboard/logs show exactly where the content went.
+        """
+        if not isinstance(result, dict):
+            raise RuntimeError(f"Facebook Graph API returned unexpected response: {result!r}")
+
+        logger.info("Facebook Graph API raw response: %s", json.dumps(result, ensure_ascii=False)[:1000])
+
+        post_id = str(result.get("post_id") or result.get("id") or "").strip()
+        photo_id = str(result.get("id") or "").strip() if had_image else ""
+        verify_errors: list[str] = []
+
+        # Best path: /{page-id}_{post-id}?fields=permalink_url,is_published...
+        if post_id:
+            try:
+                data = self._facebook_get_json(
+                    version,
+                    post_id,
+                    token,
+                    params={"fields": "id,permalink_url,is_published,created_time,from,message,full_picture"},
+                )
+                permalink = data.get("permalink_url") or data.get("link")
+                is_published = data.get("is_published")
+                if permalink:
+                    logger.info("✅ Facebook post verified. post_id=%s published=%s url=%s", data.get("id", post_id), is_published, permalink)
+                    data["verified_permalink_url"] = permalink
+                    return data
+                verify_errors.append(f"post object has no permalink_url: {json.dumps(data, ensure_ascii=False)[:500]}")
+            except Exception as e:
+                verify_errors.append(f"post_id verify failed: {e}")
+
+        # Photo fallback: /{photo-id}?fields=link,created_time,from
+        if photo_id and photo_id != post_id:
+            try:
+                data = self._facebook_get_json(
+                    version,
+                    photo_id,
+                    token,
+                    params={"fields": "id,link,created_time,from,name"},
+                )
+                link = data.get("link")
+                if link:
+                    logger.info("✅ Facebook photo object verified. photo_id=%s url=%s", data.get("id", photo_id), link)
+                    data["verified_permalink_url"] = link
+                    return data
+                verify_errors.append(f"photo object has no link: {json.dumps(data, ensure_ascii=False)[:500]}")
+            except Exception as e:
+                verify_errors.append(f"photo_id verify failed: {e}")
+
+        # Last resort: inspect latest Page feed posts and log them for debugging.
+        try:
+            feed = self._facebook_get_json(
+                version,
+                f"{page_id}/feed",
+                token,
+                params={"fields": "id,created_time,permalink_url,message,from", "limit": "5"},
+            )
+            logger.warning("Facebook latest Page feed after publish attempt: %s", json.dumps(feed, ensure_ascii=False)[:1500])
+        except Exception as e:
+            verify_errors.append(f"latest feed check failed: {e}")
+
+        if env_bool("FACEBOOK_REQUIRE_VERIFY", True):
+            raise RuntimeError(
+                "Facebook Graph API returned success but the bot could not verify a visible post URL. "
+                "Check that FACEBOOK_PAGE_ID is the exact target Page, the token is a Page Access Token for that Page, "
+                "and the post is not going to another Page/Photo library only. Details: " + " | ".join(verify_errors[-5:])
+            )
+
+        logger.warning(
+            "Facebook Graph API returned success but permalink verification failed. result=%s errors=%s",
+            json.dumps(result, ensure_ascii=False)[:1000],
+            " | ".join(verify_errors[-5:]),
+        )
+        return result
+
     def post_facebook_graph_api(self, text: str, page_id: str, page_access_token: str, image_path: str | None = None):
         version = os.getenv("META_GRAPH_API_VERSION", "v24.0").strip() or "v24.0"
+        page_id = str(page_id or "").strip()
+        page_access_token = str(page_access_token or "").strip()
         image_path = self._valid_image_path(image_path)
 
+        if not page_id or not page_access_token:
+            raise RuntimeError("Facebook Page ID or Page Access Token is empty.")
+
+        # Verify the token really belongs to / can read this Page before posting.
+        page_info = self._facebook_get_json(
+            version,
+            page_id,
+            page_access_token,
+            params={"fields": "id,name,link"},
+        )
+        logger.info("Facebook target Page verified: id=%s name=%s link=%s", page_info.get("id"), page_info.get("name"), page_info.get("link"))
+
         if image_path:
-            url = f"https://graph.facebook.com/{version}/{page_id}/photos"
+            url = self._facebook_graph_url(version, f"{page_id}/photos")
             with open(image_path, "rb") as f:
                 r = requests.post(
                     url,
@@ -1558,22 +1785,33 @@ class PlaywrightSocialService:
                 )
             if r.status_code not in (200, 201):
                 raise RuntimeError(f"Facebook Graph API photo post failed: HTTP {r.status_code} | {r.text[:500]}")
-            logger.info("✅ Posted image + text to Facebook Page via Graph API.")
-            return r.json()
+            try:
+                result = r.json()
+            except Exception:
+                raise RuntimeError(f"Facebook Graph API photo post returned non-JSON response: {r.text[:300]}")
+            verified = self._facebook_verify_publish(version, page_id, page_access_token, result, had_image=True)
+            logger.info("✅ Posted image + text to Facebook Page via Graph API and verified the published object.")
+            return verified
 
-        url = f"https://graph.facebook.com/{version}/{page_id}/feed"
+        url = self._facebook_graph_url(version, f"{page_id}/feed")
         r = requests.post(
             url,
             data={
                 "message": (text or "").strip(),
                 "access_token": page_access_token,
+                "published": "true",
             },
             timeout=30,
         )
         if r.status_code not in (200, 201):
             raise RuntimeError(f"Facebook Graph API post failed: HTTP {r.status_code} | {r.text[:500]}")
-        logger.info("✅ Posted to Facebook Page via Graph API.")
-        return r.json()
+        try:
+            result = r.json()
+        except Exception:
+            raise RuntimeError(f"Facebook Graph API post returned non-JSON response: {r.text[:300]}")
+        verified = self._facebook_verify_publish(version, page_id, page_access_token, result, had_image=False)
+        logger.info("✅ Posted text to Facebook Page via Graph API and verified the published object.")
+        return verified
 
     async def _try_click_or_shortcut(self, page, selectors: List[str], *, platform: str, timeout: int = 7000, allow_shortcut: bool = True) -> bool:
         """Click known publish buttons.

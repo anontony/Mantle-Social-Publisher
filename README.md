@@ -590,7 +590,7 @@ Check:
 
 For X browser fallback, cookies may have expired or the platform UI may have changed. Re-export X cookies and use the test button.
 
-For Facebook, verify that `FACEBOOK_PAGE_ID` and `FACEBOOK_PAGE_ACCESS_TOKEN` are correct, the token belongs to the target Page, and it has Page publishing permission. Facebook browser/cookie posting is not used in this build.
+For Facebook, verify that `FACEBOOK_PAGE_ID` and `FACEBOOK_PAGE_ACCESS_TOKEN` are correct, the token belongs to the target Page, and it has Page publishing permission. Facebook browser/cookie posting is not used in this build. The app verifies the returned post/photo object and logs the real Facebook permalink; set `FACEBOOK_REQUIRE_VERIFY=1` to fail fast if Meta returns success but no visible permalink can be confirmed.
 
 ## Simple ERC-8004 / Verified BlockScam Proof Mode
 
@@ -642,3 +642,36 @@ ERC8004_VALIDATION_REGISTRY=0xYourDeployedValidationRegistry
 ```
 
 For a quick demo, `ERC8004_VALIDATOR_ADDRESS` can be the Proof Writer wallet address or another fresh validator wallet.
+
+
+## Railway Volume Storage Cleanup
+
+Generated article images are uploaded to WordPress and temporarily reused for Telegram, X, and Facebook posting. To prevent Railway Volume growth, the app deletes the local copy from `/data/social_images` after social posting finishes. This cleanup never touches user configuration, wallet workspaces, Telegram sessions, browser profiles, local proofs, or `/data/app.db`.
+
+Recommended variables:
+
+```env
+SOCIAL_IMAGE_DELETE_AFTER_POST=1
+SOCIAL_IMAGE_RETENTION_HOURS=6
+SOCIAL_IMAGE_MAX_TOTAL_MB=256
+DEBUG_SNAPSHOT_RETENTION_HOURS=24
+```
+
+Manual safe cleanup is also available from the dashboard: **Home → Clean Generated Images**.
+
+Do not delete these paths if you want to keep user data:
+
+```text
+/data/app.db
+/data/sessions/
+/data/browser_profiles/
+/data/proofs/
+```
+
+Safe to clean when storage grows:
+
+```text
+/data/social_images/
+/data/facebook_post_failed_debug_*.png
+/data/facebook_post_failed_debug_*.html
+```
