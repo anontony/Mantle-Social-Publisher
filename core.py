@@ -7,6 +7,7 @@ import json
 import time
 import base64
 import hashlib
+import shutil
 import queue
 import random
 import sqlite3
@@ -370,14 +371,67 @@ class ConfigStore:
 # DATABASE
 # =========================================================
 
+SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "60000"))
+
+def open_sqlite_connection(path: Path) -> sqlite3.Connection:
+    """Open SQLite with settings that survive concurrent bot/web writes.
+
+    The dashboard, Telegram forwarder, BlockScam monitor, proof writer, and
+    web routes can all touch the same database. Railway volumes also make short
+    write collisions more visible. WAL + busy_timeout + small retry loops avoid
+    user-facing `database is locked` errors without changing the data model.
+    """
+    conn = sqlite3.connect(
+        path,
+        timeout=max(5, SQLITE_BUSY_TIMEOUT_MS / 1000),
+        check_same_thread=False,
+    )
+    try:
+        conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+    except Exception:
+        # Some environments may reject a PRAGMA while another process is opening
+        # the DB. The connection timeout/retry path below still protects writes.
+        pass
+    return conn
+
+
+def is_sqlite_busy_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "database is locked" in text or "database is busy" in text or "database table is locked" in text
+
+
 class AppDB:
     def __init__(self, path: Path):
-        self.conn = sqlite3.connect(path, check_same_thread=False)
-        self.lock = threading.Lock()
+        self.conn = open_sqlite_connection(path)
+        self.lock = threading.RLock()
         self.init()
 
-    def init(self):
+    def _run(self, fn):
+        delay = 0.20
+        last_error = None
         with self.lock:
+            for attempt in range(8):
+                try:
+                    return fn()
+                except sqlite3.OperationalError as e:
+                    if not is_sqlite_busy_error(e):
+                        raise
+                    last_error = e
+                    try:
+                        self.conn.rollback()
+                    except Exception:
+                        pass
+                    if attempt >= 7:
+                        break
+                    time.sleep(delay + random.random() * 0.10)
+                    delay = min(2.5, delay * 1.7)
+            raise last_error
+
+    def init(self):
+        def op():
             c = self.conn.cursor()
             c.execute("""
             CREATE TABLE IF NOT EXISTS seen_news (
@@ -406,36 +460,41 @@ class AppDB:
             )
             """)
             self.conn.commit()
+        self._run(op)
 
     def is_seen_news(self, uid: str) -> bool:
-        with self.lock:
+        def op():
             c = self.conn.cursor()
             c.execute("SELECT 1 FROM seen_news WHERE uid=?", (uid,))
             return c.fetchone() is not None
+        return bool(self._run(op))
 
     def mark_seen_news(self, uid: str):
-        with self.lock:
+        def op():
             c = self.conn.cursor()
             c.execute(
                 "INSERT OR IGNORE INTO seen_news(uid, created_at) VALUES (?, ?)",
                 (uid, datetime.now(timezone.utc).isoformat())
             )
             self.conn.commit()
+        self._run(op)
 
     def is_sent_message(self, msg_id: int) -> bool:
-        with self.lock:
+        def op():
             c = self.conn.cursor()
             c.execute("SELECT 1 FROM sent_messages WHERE message_id=?", (msg_id,))
             return c.fetchone() is not None
+        return bool(self._run(op))
 
     def mark_sent_message(self, msg_id: int):
-        with self.lock:
+        def op():
             c = self.conn.cursor()
             c.execute(
                 "INSERT OR IGNORE INTO sent_messages(message_id, created_at) VALUES (?, ?)",
                 (msg_id, datetime.now(timezone.utc).isoformat())
             )
             self.conn.commit()
+        self._run(op)
 
     def save_moderation_proof(
         self,
@@ -449,7 +508,7 @@ class AppDB:
         risk_score: int,
         tx_hash: str = "",
     ):
-        with self.lock:
+        def op():
             c = self.conn.cursor()
             c.execute(
                 """
@@ -471,15 +530,17 @@ class AppDB:
                 )
             )
             self.conn.commit()
+        self._run(op)
 
     def update_moderation_tx(self, proof_hash: str, tx_hash: str):
-        with self.lock:
+        def op():
             c = self.conn.cursor()
             c.execute(
                 "UPDATE moderation_proofs SET tx_hash=? WHERE proof_hash=?",
                 (tx_hash or "", proof_hash)
             )
             self.conn.commit()
+        self._run(op)
 
 
 db = AppDB(DB_PATH)
@@ -1488,21 +1549,34 @@ class PlaywrightSocialService:
         logger.info("✅ Posted to Facebook Page via Graph API.")
         return r.json()
 
-    async def _try_click_or_shortcut(self, page, selectors: List[str], *, platform: str, timeout: int = 7000) -> bool:
-        """Click known publish buttons, then fallback to Ctrl/Cmd+Enter.
+    async def _try_click_or_shortcut(self, page, selectors: List[str], *, platform: str, timeout: int = 7000, allow_shortcut: bool = True) -> bool:
+        """Click known publish buttons.
 
-        This is still a browser fallback. The preferred production path is the
-        official platform API because social UIs change frequently.
+        Browser posting is a fallback path and social UIs change often. We only
+        return True when a real visible/enabled publish button was clicked, or
+        when shortcut fallback is explicitly allowed for that platform. Facebook
+        is intentionally stricter so the log does not say "Posted" when the UI
+        only received Ctrl+Enter but did not publish anything.
         """
         for sel in selectors:
             try:
-                btn = page.locator(sel).last
-                await btn.wait_for(timeout=timeout)
-                if await btn.is_visible() and await btn.is_enabled():
-                    await btn.click()
-                    return True
+                loc = page.locator(sel)
+                count = await loc.count()
+                if count <= 0:
+                    continue
+                for idx in range(count - 1, -1, -1):
+                    btn = loc.nth(idx)
+                    try:
+                        if await btn.is_visible() and await btn.is_enabled():
+                            await btn.click()
+                            return True
+                    except Exception:
+                        continue
             except Exception:
                 pass
+
+        if not allow_shortcut:
+            return False
 
         try:
             await page.keyboard.press("Control+Enter")
@@ -1519,6 +1593,33 @@ class PlaywrightSocialService:
             return True
         except Exception:
             return False
+
+    async def _facebook_composer_still_open(self, page) -> bool:
+        """Best-effort check that Facebook's composer dialog is still open."""
+        selectors = [
+            'div[aria-label="Post"][role="button"]',
+            'div[aria-label="Đăng"][role="button"]',
+            'div[aria-label*="Post"][role="button"]',
+            'div[aria-label*="Đăng"][role="button"]',
+            'div[role="dialog"] div[role="textbox"]',
+            'div[role="dialog"] div[contenteditable="true"]',
+        ]
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).last
+                if await loc.count() > 0 and await loc.is_visible():
+                    return True
+            except Exception:
+                pass
+        return False
+
+    async def _confirm_facebook_publish(self, page, *, timeout_ms: int = 25000) -> bool:
+        deadline = time.time() + max(5, timeout_ms / 1000)
+        while time.time() < deadline:
+            if not await self._facebook_composer_still_open(page):
+                return True
+            await page.wait_for_timeout(1000)
+        return False
 
     async def _attach_image_if_possible(self, page, image_path: str | None, *, platform: str) -> bool:
         image_path = self._valid_image_path(image_path)
@@ -1726,23 +1827,25 @@ class PlaywrightSocialService:
                 await self._attach_image_if_possible(page, image_path, platform="Facebook")
 
                 post_buttons = [
+                    'div[role="dialog"] div[aria-label="Post"][role="button"]',
+                    'div[role="dialog"] div[aria-label="Đăng"][role="button"]',
+                    'div[role="dialog"] div[aria-label*="Post"][role="button"]',
+                    'div[role="dialog"] div[aria-label*="Đăng"][role="button"]',
+                    'div[role="dialog"] div[role="button"]:has-text("Post")',
+                    'div[role="dialog"] div[role="button"]:has-text("Đăng")',
                     'div[aria-label="Post"][role="button"]',
                     'div[aria-label="Đăng"][role="button"]',
-                    'div[aria-label*="Post"][role="button"]',
-                    'div[aria-label*="Đăng"][role="button"]',
-                    'div[role="button"]:has-text("Post")',
-                    'div[role="button"]:has-text("Đăng")',
-                    'span:has-text("Post")',
-                    'span:has-text("Đăng")'
                 ]
 
-                clicked = await self._try_click_or_shortcut(page, post_buttons, platform="Facebook", timeout=10000)
+                clicked = await self._try_click_or_shortcut(page, post_buttons, platform="Facebook", timeout=10000, allow_shortcut=False)
 
                 if not clicked:
-                    raise RuntimeError("Could not find or trigger the Facebook Post button. Prefer Facebook Page Graph API credentials for reliable posting.")
+                    raise RuntimeError("Could not find a real Facebook Post button. Facebook browser posting was not confirmed. Re-check Cookie JSON/Target URL, or use Facebook Page Graph API for reliable posting.")
 
-                await page.wait_for_timeout(8000)
-                logger.info("✅ Posted to Facebook.")
+                if not await self._confirm_facebook_publish(page):
+                    raise RuntimeError("Facebook publish was clicked but not confirmed. The composer stayed open, so the post may not have been published. Check whether Facebook asked for extra confirmation, captcha, account checkpoint, or media upload review.")
+
+                logger.info("✅ Posted to Facebook and composer closed.")
 
             finally:
                 await context.close()
@@ -1757,9 +1860,52 @@ class TelegramService:
         self.pending_client: Optional[TelegramClient] = None
         self.pending_phone: str = ""
 
-    def session_path(self, session_name: str) -> str:
-        clean = session_name.strip() or "forward_session"
-        return str(SESSION_DIR / clean)
+    def session_path(self, session_name: str, purpose: str = "") -> str:
+        """Return a Telethon session base path.
+
+        The dashboard login writes the primary session. Long-running features
+        such as Telegram forwarding, BlockScam, and one-off social posting must
+        not open the exact same SQLite session file at the same time; Telethon
+        can otherwise raise `database is locked`. For worker purposes we create
+        a purpose-specific copy of the authorized base session and connect with
+        that copy. The user still logs in only once.
+        """
+        clean = re.sub(r"[^a-zA-Z0-9_.-]+", "_", (session_name or "forward_session").strip()) or "forward_session"
+        if not purpose:
+            return str(SESSION_DIR / clean)
+
+        purpose_clean = re.sub(r"[^a-zA-Z0-9_.-]+", "_", purpose.strip()) or "worker"
+        base_no_ext = SESSION_DIR / clean
+        worker_no_ext = SESSION_DIR / f"{clean}_{purpose_clean}"
+        base_file = Path(str(base_no_ext) + ".session")
+        worker_file = Path(str(worker_no_ext) + ".session")
+
+        try:
+            if base_file.exists():
+                should_copy = (not worker_file.exists()) or (base_file.stat().st_mtime > worker_file.stat().st_mtime)
+                if should_copy:
+                    tmp_file = Path(str(worker_file) + ".tmp")
+                    copied = False
+                    try:
+                        src = sqlite3.connect(str(base_file), timeout=max(5, SQLITE_BUSY_TIMEOUT_MS / 1000), uri=False)
+                        dst = sqlite3.connect(str(tmp_file), timeout=max(5, SQLITE_BUSY_TIMEOUT_MS / 1000), uri=False)
+                        with dst:
+                            src.backup(dst)
+                        src.close()
+                        dst.close()
+                        copied = True
+                    except Exception:
+                        try:
+                            shutil.copy2(base_file, tmp_file)
+                            copied = True
+                        except Exception as copy_error:
+                            logger.warning(f"Could not prepare Telegram {purpose_clean} session copy: {copy_error}")
+                    if copied:
+                        tmp_file.replace(worker_file)
+        except Exception as e:
+            logger.warning(f"Telegram session copy check failed for {purpose_clean}: {e}")
+
+        return str(worker_no_ext)
 
     def api_pair(self) -> Tuple[int, str]:
         cfg = self.cfg_getter()
@@ -1906,7 +2052,7 @@ class TelegramService:
 
         api_id, api_hash = self.api_pair()
         client = TelegramClient(
-            self.session_path(cfg.telegram_session_name),
+            self.session_path(cfg.telegram_session_name, "social_post"),
             api_id,
             api_hash
         )
@@ -1915,7 +2061,9 @@ class TelegramService:
 
         if not await client.is_user_authorized():
             await client.disconnect()
-            raise RuntimeError("Telegram session is not logged in.")
+            raise RuntimeError("Telegram session is not logged in. Log in once from the Telegram Login tab, then try again.")
+
+        logger.info(f"✅ Telegram social session ready. Sending to {len(targets)} target(s).")
 
         for i, target in enumerate(targets, start=1):
             try:
@@ -1925,6 +2073,7 @@ class TelegramService:
                     await client.send_file(target, valid_image, caption=self._telegram_caption(text))
                 else:
                     await client.send_message(target, text)
+                logger.info(f"✅ Posted to Telegram social target: {target}")
                 await asyncio.sleep(2)
             except FloodWaitError as e:
                 logger.warning(f"FloodWait {e.seconds}s")
@@ -1943,7 +2092,7 @@ class TelegramService:
 
         api_id, api_hash = self.api_pair()
         client = TelegramClient(
-            self.session_path(cfg.telegram_session_name),
+            self.session_path(cfg.telegram_session_name, "forward_loop"),
             api_id,
             api_hash
         )
@@ -1952,7 +2101,7 @@ class TelegramService:
 
         if not await client.is_user_authorized():
             await client.disconnect()
-            logger.error("Telegram session is not logged in; cannot forward.")
+            logger.error("Telegram forward session is not logged in. Log in once from the Telegram Login tab, then restart the bot.")
             return
 
         logger.info("🚀 Telegram forward loop started.")
@@ -2355,7 +2504,7 @@ MESSAGE:
 
         api_id, api_hash = self.telegram_service.api_pair()
         client = TelegramClient(
-            self.telegram_service.session_path(cfg.telegram_session_name),
+            self.telegram_service.session_path(cfg.telegram_session_name, "blockscam"),
             api_id,
             api_hash
         )
@@ -2364,7 +2513,7 @@ MESSAGE:
 
         if not await client.is_user_authorized():
             await client.disconnect()
-            logger.error("Telegram session is not logged in; cannot run BlockScam.")
+            logger.error("Telegram BlockScam session is not logged in. Log in once from the Telegram Login tab, then restart the bot.")
             return
 
         chats = parse_lines(cfg.block_scam_target_chats)

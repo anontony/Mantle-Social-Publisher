@@ -30,6 +30,7 @@ from core import (
     BlockScamService,
     AsyncRuntime,
     DB_PATH,
+    open_sqlite_connection,
     PROJECT_OWNER_WALLET,
     PROJECT_DEMO_WALLETS,
     CREDIT_TOKEN_SYMBOL,
@@ -77,7 +78,10 @@ def logs_for_user(user: Optional[dict], limit: int = MAX_LOGS) -> list[str]:
 # =========================================================
 
 def auth_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # Use the same SQLite durability/concurrency settings as the bot database
+    # helper in core.py. This prevents short collisions between dashboard writes
+    # and background bot writes from becoming user-facing `database is locked` errors.
+    conn = open_sqlite_connection(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
