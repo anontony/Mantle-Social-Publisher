@@ -1459,21 +1459,84 @@ class PlaywrightSocialService:
             cut = cut.rsplit(" ", 1)[0].rstrip()
         return (cut or text[: max(0, limit - 1)].rstrip()) + "…"
 
+    def _strip_trailing_ellipsis(self, text: str) -> str:
+        """Remove AI/browser-looking trailing ellipses from a caption fragment."""
+        return re.sub(r"(?:\s*(?:\.{3,}|…))+\s*$", "", (text or "").strip()).strip()
+
+    def _finish_short_sentence(self, text: str) -> str:
+        """Make a hard-cut X caption look intentional instead of unfinished."""
+        text = self._strip_trailing_ellipsis(text)
+        text = re.sub(r"[,:;،，]+\s*$", "", text).strip()
+        if text and text[-1] not in ".!?。！？":
+            text += "."
+        return text
+
+    def _shorten_for_x_body(self, text: str, limit: int) -> str:
+        """Shorten X body without adding ellipsis.
+
+        The previous version respected the 280-character limit but appended an
+        ellipsis before the link. That made posts look like they were broken or
+        auto-truncated. This helper deliberately creates a shorter, finished
+        sentence/clause and keeps the link visible on a separate line.
+        """
+        text = self._strip_trailing_ellipsis(re.sub(r"\s+", " ", (text or "").strip()))
+        if len(text) <= limit:
+            return text
+
+        window = text[:limit].rstrip()
+
+        # Prefer a complete sentence.
+        sentence_positions = [window.rfind(mark) for mark in [".", "!", "?", "。", "！", "？"]]
+        sentence_cut = max(sentence_positions)
+        if sentence_cut >= max(70, int(limit * 0.45)):
+            return self._finish_short_sentence(window[: sentence_cut + 1])
+
+        # Then prefer a natural clause boundary.
+        clause_positions = [window.rfind(mark) for mark in [";", ":", "—", "–", ",", "，"]]
+        clause_cut = max(clause_positions)
+        if clause_cut >= max(70, int(limit * 0.45)):
+            return self._finish_short_sentence(window[:clause_cut])
+
+        # Last resort: cut at a word boundary and close the sentence.
+        if " " in window:
+            window = window.rsplit(" ", 1)[0].rstrip()
+        return self._finish_short_sentence(window)
+
     def _x_post_text(self, text: str) -> str:
-        """Create a clean X-length post and preserve the article link when present."""
+        """Create a compact X post and preserve the article link.
+
+        X supports 280 characters, but long text + an image often looks messy in
+        the timeline. Keep browser/API posts intentionally short so users never
+        see a half-cut caption such as ``...`` before the link.
+        """
         text = re.sub(r"\s+", " ", (text or "").strip())
         urls = re.findall(r"https?://\S+", text)
         url = urls[-1].rstrip(".,)") if urls else ""
         body = re.sub(r"https?://\S+", "", text).strip()
+        body = self._strip_trailing_ellipsis(body)
+
+        try:
+            body_max = int(os.getenv("X_BODY_MAX_CHARS", "155") or "155")
+        except Exception:
+            body_max = 155
+        body_max = max(80, min(body_max, 220))
 
         if url:
-            limit = max(40, 280 - len(url) - 2)
-            body = self._shorten_at_word(body, limit)
-            final = f"{body}\n{url}".strip()
+            # Leave room for the URL and spacing even when a real URL is longer
+            # than X's t.co counted length.
+            absolute_max_body = max(40, 270 - len(url) - 2)
+            body = self._shorten_for_x_body(body, min(body_max, absolute_max_body))
+            final = f"{body}\n\n{url}".strip() if body else url
         else:
-            final = self._shorten_at_word(body, 280)
+            final = self._shorten_for_x_body(body, min(body_max, 240))
 
-        return final[:280].rstrip()
+        # Never append ellipsis on X. If the string is still too long because of
+        # an unusually long URL, make one more hard cut on the body only.
+        if len(final) > 280 and url:
+            allowed = max(20, 276 - len(url))
+            body = self._shorten_for_x_body(body, allowed)
+            final = f"{body}\n\n{url}".strip() if body else url
+        return self._strip_trailing_ellipsis(final[:280]).rstrip()
 
     def _telegram_caption(self, text: str) -> str:
         text = (text or "").strip()
