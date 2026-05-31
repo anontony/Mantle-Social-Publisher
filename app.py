@@ -762,7 +762,7 @@ def save_from_form(data: Dict[str, Any]) -> None:
         "telegram_bot_token", "telegram_bot_chat_ids",
         "telegram_source_channel", "telegram_target_channels",
         "x_auth_token", "x_ct0", "x_api_access_token",
-        "facebook_cookie_json", "facebook_target_url", "facebook_page_id", "facebook_page_access_token",
+        "facebook_page_id", "facebook_page_access_token",
         "block_scam_keywords", "block_scam_target_chats", "wp_publish_status",
         "erc8004_rpc_url", "erc8004_agent_registry", "erc8004_reputation_registry", "erc8004_validation_registry",
         "erc8004_validator_address", "erc8004_agent_id", "erc8004_evidence_base_url", "erc8004_private_key",
@@ -1343,7 +1343,7 @@ option{{background:#14121e;color:var(--text)}}
     {nav_item('forward', 'Telegram Forward', tab)}
     {nav_item('blockscam', 'BlockScam', tab)}
     <div class="nav-section">Settings</div>
-    {nav_item('login', 'Login & Cookies', tab)}
+    {nav_item('login', 'Login & API', tab)}
     {nav_item('log', 'System Logs', tab)}
   </aside>
   <main class="main">
@@ -1978,14 +1978,14 @@ def home_content() -> str:
 </div>
 <div class="card">
   <h3>Personal Workspace</h3>
-  <p class="help">Each connected wallet has its own saved OpenAI key, WordPress credentials, Telegram session name, target channels, X cookies, Facebook cookies, posting switches, forward settings, and BlockScam settings. When a user logs in again, the dashboard reloads that wallet's personal setup automatically.</p>
+  <p class="help">Each connected wallet has its own saved OpenAI key, WordPress credentials, Telegram session name, target channels, X cookies, Facebook Page API settings, posting switches, forward settings, and BlockScam settings. When a user logs in again, the dashboard reloads that wallet's personal setup automatically.</p>
 </div>
 <div class="card">
   <h3>Recommended Setup Flow</h3>
   <div class="workflow">
     <div class="step"><strong>1</strong><h4>User Profile</h4><p>Connect a wallet and activate the monthly Mantle plan.</p></div>
     <div class="step"><strong>2</strong><h4>RSS / WordPress</h4><p>Configure OpenAI, WordPress, categories, and publishing rules.</p></div>
-    <div class="step"><strong>3</strong><h4>Login & Cookies</h4><p>Add Telegram session details and X/Facebook cookies.</p></div>
+    <div class="step"><strong>3</strong><h4>Login & API</h4><p>Add Telegram session details, X access, and Facebook Page API credentials.</p></div>
     <div class="step"><strong>4</strong><h4>Run Automation</h4><p>Test each channel, then start the bot or publish one article now.</p></div>
   </div>
 </div>
@@ -2145,28 +2145,30 @@ def login_content() -> str:
 </div>
 
 <div class="card">
-  <h3>Facebook Cookie</h3>
+  <h3>Facebook Page API</h3>
+  <p class="help">Facebook posting now uses Meta Graph API only. Cookie/browser posting has been removed to avoid selector errors, comment-box mistakes, and unstable Facebook UI changes.</p>
   <form method="post" action="/save?next=login">
     <input type="hidden" name="bool__enable_facebook_post" value="1">
     <div class="grid">
-      <label>Facebook Page ID (preferred Graph API)</label><input name="facebook_page_id" value="{esc(getattr(cfg, 'facebook_page_id', ''))}" placeholder="Your Page ID">
-      <label>Facebook Page Access Token</label>{secret_input("facebook_page_access_token", getattr(cfg, 'facebook_page_access_token', ''), "Page access token with publish permission") }
-      <label>Facebook Target URL (browser fallback)</label><input name="facebook_target_url" value="{esc(cfg.facebook_target_url)}">
-      <label>Facebook Cookie JSON (browser fallback)</label>{secret_textarea("facebook_cookie_json", cfg.facebook_cookie_json)}
+      <label>Facebook Page ID</label><input name="facebook_page_id" value="{esc(getattr(cfg, 'facebook_page_id', ''))}" placeholder="Example: 123456789012345">
+      <label>Facebook Page Access Token</label>{secret_input("facebook_page_access_token", getattr(cfg, 'facebook_page_access_token', ''), "EAAG... Page access token") }
     </div>
     <div class="checkrow"><label><input type="checkbox" name="enable_facebook_post" {checked('enable_facebook_post')}> Enable Facebook Posting</label></div>
-    <div class="actions"><button class="primary">Save Facebook Cookie</button></div>
+    <div class="actions"><button class="primary">Save Facebook API</button></div>
   </form>
-  <details class="setup-guide">
-    <summary>Facebook setup guide</summary>
+  <details class="setup-guide" open>
+    <summary>How to get Facebook Page ID + Page Access Token</summary>
     <div class="setup-guide-body">
       <ol>
-        <li>Preferred option: use Meta Graph API Page publishing. Create a Meta app, connect a Page, and generate a Page Access Token with permission to publish Page posts.</li>
-        <li>Paste the Page ID and Page Access Token above. This posts through Graph API and avoids Facebook UI selector issues.</li>
-        <li>Browser fallback: log in to Facebook in a normal browser session, export cookies as JSON, and enter the target URL where the bot should create the post.</li>
-        <li>Enable Facebook posting, save, then click <b>Test Facebook Post</b>.</li>
+        <li>Go to <b>developers.facebook.com/tools/explorer</b> and select your Meta app.</li>
+        <li>In <b>Permissions</b>, add: <code>pages_show_list</code>, <code>pages_read_engagement</code>, and <code>pages_manage_posts</code>. If some permissions are missing, add the Page management use case in your Meta app first.</li>
+        <li>Click <b>Generate Access Token</b>, log in with the Facebook account that manages the Page, and allow access to the target Page.</li>
+        <li>Run this Graph Explorer request: <code>GET me/accounts?fields=id,name,access_token,tasks</code>.</li>
+        <li>Find your Page in the response. Copy <code>id</code> into <b>Facebook Page ID</b> and copy that Page's <code>access_token</code> into <b>Facebook Page Access Token</b>.</li>
+        <li>Save, enable Facebook posting, then click <b>Test Facebook Post</b>. A successful test returns a Facebook post ID in the logs.</li>
       </ol>
-      <p>If Facebook shows checkpoint, login, or permission screens, renew the cookie JSON and confirm that the account can post to the target URL manually.</p>
+      <p><b>Security:</b> the Page Access Token can publish to your Page. Do not commit it to GitHub, do not share it publicly, and rotate it if exposed.</p>
+      <p><b>Note:</b> Graph API publishing works for Facebook Pages. It does not publish to a personal profile.</p>
     </div>
   </details>
   <form method="post" action="/test-facebook"><button>Test Facebook Post</button></form>

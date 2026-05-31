@@ -310,9 +310,9 @@ https://your-domain.com/wp-json/wp/v2/posts
 
 The WordPress JWT must allow post creation and media upload.
 
-### 7.3 Login & Cookies
+### 7.3 Login & API
 
-This page now includes expandable English setup guides for Telegram, X, and Facebook.
+This page includes expandable English setup guides for Telegram, X, and Facebook Page API.
 
 #### Telegram
 
@@ -345,14 +345,24 @@ Required:
 
 After saving, click **Test X Post**.
 
-#### Facebook
+#### Facebook Page API
 
 Required:
 
-- Facebook target URL.
-- Facebook cookie JSON.
+- Facebook Page ID.
+- Facebook Page Access Token with Page publishing permission.
 
-After saving, click **Test Facebook Post**.
+How to get it:
+
+1. Open Meta Graph API Explorer.
+2. Select your Meta app.
+3. Add permissions: `pages_show_list`, `pages_read_engagement`, and `pages_manage_posts`.
+4. Generate a user access token and allow access to the target Page.
+5. Run `GET me/accounts?fields=id,name,access_token,tasks`.
+6. Copy the Page `id` and that Page's `access_token` into the dashboard.
+7. Save and click **Test Facebook Post**.
+
+Facebook cookie/browser posting has been removed. This avoids unstable UI selectors and prevents accidental comments/share-flow clicks.
 
 ### 7.4 Social Posting
 
@@ -578,7 +588,9 @@ Check:
 
 ### Social posting fails
 
-Cookies may have expired or the platform UI may have changed. Re-export cookies and use the test buttons.
+For X browser fallback, cookies may have expired or the platform UI may have changed. Re-export X cookies and use the test button.
+
+For Facebook, verify that `FACEBOOK_PAGE_ID` and `FACEBOOK_PAGE_ACCESS_TOKEN` are correct, the token belongs to the target Page, and it has Page publishing permission. Facebook browser/cookie posting is not used in this build.
 
 ## Simple ERC-8004 / Verified BlockScam Proof Mode
 
