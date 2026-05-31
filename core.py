@@ -43,7 +43,14 @@ PROJECT_OWNER_WALLET = (
     or DEFAULT_PROJECT_OWNER_WALLET
 ).strip()
 
-_demo_wallets_raw = os.getenv("DEMO_WALLETS", "").strip()
+# Demo wallets can be configured from Railway Variables.
+# Supports both DEMO_WALLETS and PROJECT_DEMO_WALLETS for compatibility.
+# If neither is set, the project owner wallet is treated as the demo wallet.
+_demo_wallets_raw = (
+    os.getenv("PROJECT_DEMO_WALLETS")
+    or os.getenv("DEMO_WALLETS")
+    or PROJECT_OWNER_WALLET
+).strip()
 PROJECT_DEMO_WALLETS = {
     wallet.strip().lower()
     for wallet in re.split(r"[,\n]+", _demo_wallets_raw)
@@ -209,6 +216,12 @@ class AppConfig:
     # next to Telegram login settings, similar to Facebook Target URL.
     telegram_post_channel_url: str = ""
 
+    # Preferred API-based Telegram posting. If these are configured, social posts are sent
+    # through Telegram Bot API instead of browser/UI flows. The bot must be admin/member
+    # in the target chat/channel. `telegram_bot_chat_ids` can contain one chat_id/@channel per line.
+    telegram_bot_token: str = ""
+    telegram_bot_chat_ids: str = ""
+
     # Existing multi-target field is kept for forward/social workflows.
     telegram_target_channels: str = ""
     enable_telegram_forward: bool = False
@@ -216,10 +229,17 @@ class AppConfig:
 
     x_auth_token: str = ""
     x_ct0: str = ""
+    # Preferred X API v2 user access token with tweet.write permission.
+    # If configured, posting uses POST /2/tweets instead of trying to click the X UI.
+    x_api_access_token: str = ""
     enable_x_post: bool = False
 
     facebook_cookie_json: str = ""
     facebook_target_url: str = ""
+    # Preferred Meta Graph API Page publishing. If both values are configured, posting uses
+    # /{page-id}/feed instead of trying to click the Facebook composer UI.
+    facebook_page_id: str = ""
+    facebook_page_access_token: str = ""
     enable_facebook_post: bool = False
 
     # Web3 subscription settings
@@ -1048,7 +1068,10 @@ LINK:
                 messages=[{"role": "user", "content": prompt}],
                 max_completion_tokens=400,
             )
-            return self._repair_article_if_needed(news, news.get("title", "Market Update"), clean_ai_output(res.choices[0].message.content))
+            summary = clean_ai_output(res.choices[0].message.content or "")
+            if link and link not in summary:
+                summary = f"{summary.rstrip()}\n\n{link}"
+            return summary or f"{title}\n\n{plain[:500]}...\n\n{link}"
         except Exception as e:
             logger.error(f"Social summary error: {e}")
             return f"{title}\n\n{plain[:500]}...\n\n{link}"
@@ -1318,13 +1341,94 @@ class PlaywrightSocialService:
         except Exception as e:
             logger.error(f"Facebook Cookie JSON error: {e}")
 
+    def _env_or_cfg(self, cfg, attr: str, env_name: str = "") -> str:
+        value = str(getattr(cfg, attr, "") or "").strip()
+        if value:
+            return value
+        return os.getenv(env_name or attr.upper(), "").strip()
+
+    def _x_post_text(self, text: str) -> str:
+        text = (text or "").strip()
+        if len(text) <= 280:
+            return text
+        return text[:276].rstrip() + "…"
+
+    def post_x_api(self, text: str, access_token: str):
+        payload = {"text": self._x_post_text(text)}
+        r = requests.post(
+            "https://api.twitter.com/2/tweets",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        if r.status_code not in (200, 201):
+            raise RuntimeError(f"X API post failed: HTTP {r.status_code} | {r.text[:500]}")
+        logger.info("✅ Posted to X via API.")
+        return r.json()
+
+    def post_facebook_graph_api(self, text: str, page_id: str, page_access_token: str):
+        version = os.getenv("META_GRAPH_API_VERSION", "v24.0").strip() or "v24.0"
+        url = f"https://graph.facebook.com/{version}/{page_id}/feed"
+        r = requests.post(
+            url,
+            data={
+                "message": (text or "").strip(),
+                "access_token": page_access_token,
+            },
+            timeout=30,
+        )
+        if r.status_code not in (200, 201):
+            raise RuntimeError(f"Facebook Graph API post failed: HTTP {r.status_code} | {r.text[:500]}")
+        logger.info("✅ Posted to Facebook Page via Graph API.")
+        return r.json()
+
+    async def _try_click_or_shortcut(self, page, selectors: List[str], *, platform: str, timeout: int = 7000) -> bool:
+        """Click known publish buttons, then fallback to Ctrl/Cmd+Enter.
+
+        This is still a browser fallback. The preferred production path is the
+        official platform API because social UIs change frequently.
+        """
+        for sel in selectors:
+            try:
+                btn = page.locator(sel).last
+                await btn.wait_for(timeout=timeout)
+                if await btn.is_visible() and await btn.is_enabled():
+                    await btn.click()
+                    return True
+            except Exception:
+                pass
+
+        try:
+            await page.keyboard.press("Control+Enter")
+            await page.wait_for_timeout(2500)
+            logger.info(f"{platform}: tried Control+Enter publish shortcut as browser fallback.")
+            return True
+        except Exception:
+            pass
+
+        try:
+            await page.keyboard.press("Meta+Enter")
+            await page.wait_for_timeout(2500)
+            logger.info(f"{platform}: tried Meta+Enter publish shortcut as browser fallback.")
+            return True
+        except Exception:
+            return False
+
     async def post_x(self, text: str):
         cfg = self.cfg_getter()
         if not cfg.enable_x_post:
             logger.info("X posting is disabled, skipping X.")
             return
 
-        logger.info("🐦 Posting to X with Playwright...")
+        x_api_access_token = self._env_or_cfg(cfg, "x_api_access_token", "X_API_ACCESS_TOKEN")
+        if x_api_access_token:
+            await asyncio.to_thread(self.post_x_api, text, x_api_access_token)
+            return
+
+        logger.info("🐦 Posting to X with Playwright browser fallback...")
 
         async with async_playwright() as p:
             user_data_dir = str(PROFILE_DIR / "x_profile")
@@ -1379,20 +1483,10 @@ class PlaywrightSocialService:
                     'button[data-testid="tweetButtonInline"]'
                 ]
 
-                clicked = False
-                for sel in buttons:
-                    try:
-                        btn = page.locator(sel).first
-                        await btn.wait_for(timeout=7000)
-                        if await btn.is_enabled():
-                            await btn.click()
-                            clicked = True
-                            break
-                    except Exception:
-                        pass
+                clicked = await self._try_click_or_shortcut(page, buttons, platform="X", timeout=7000)
 
                 if not clicked:
-                    raise RuntimeError("Could not find or click the X post button.")
+                    raise RuntimeError("Could not find or trigger the X post button. Prefer X API access token for reliable posting.")
 
                 await page.wait_for_timeout(5000)
                 logger.info("✅ Posted to X.")
@@ -1406,9 +1500,15 @@ class PlaywrightSocialService:
             logger.info("Facebook posting is disabled, skipping Facebook.")
             return
 
+        page_id = self._env_or_cfg(cfg, "facebook_page_id", "FACEBOOK_PAGE_ID")
+        page_access_token = self._env_or_cfg(cfg, "facebook_page_access_token", "FACEBOOK_PAGE_ACCESS_TOKEN")
+        if page_id and page_access_token:
+            await asyncio.to_thread(self.post_facebook_graph_api, text, page_id, page_access_token)
+            return
+
         target = cfg.facebook_target_url.strip() or "https://www.facebook.com/"
 
-        logger.info("📘 Posting to Facebook with Playwright...")
+        logger.info("📘 Posting to Facebook with Playwright browser fallback...")
 
         async with async_playwright() as p:
             user_data_dir = str(PROFILE_DIR / "facebook_profile")
@@ -1491,19 +1591,10 @@ class PlaywrightSocialService:
                     'span:has-text("Đăng")'
                 ]
 
-                clicked = False
-                for sel in post_buttons:
-                    try:
-                        btn = page.locator(sel).last
-                        await btn.wait_for(timeout=10000)
-                        await btn.click()
-                        clicked = True
-                        break
-                    except Exception:
-                        pass
+                clicked = await self._try_click_or_shortcut(page, post_buttons, platform="Facebook", timeout=10000)
 
                 if not clicked:
-                    raise RuntimeError("Could not find or click the Facebook Post button.")
+                    raise RuntimeError("Could not find or trigger the Facebook Post button. Prefer Facebook Page Graph API credentials for reliable posting.")
 
                 await page.wait_for_timeout(8000)
                 logger.info("✅ Posted to Facebook.")
@@ -1591,9 +1682,32 @@ class TelegramService:
         logger.info(f"✅ Telegram session OK: {getattr(me, 'username', None) or me.id}")
         await client.disconnect()
 
+    def send_telegram_bot_api(self, text: str, bot_token: str, chat_ids: List[str]):
+        if not bot_token or not chat_ids:
+            return
+        for i, chat_id in enumerate(chat_ids, start=1):
+            r = requests.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": (text or "")[:4096],
+                    "disable_web_page_preview": False,
+                },
+                timeout=30,
+            )
+            if r.status_code not in (200, 201):
+                raise RuntimeError(f"Telegram Bot API send failed for {chat_id}: HTTP {r.status_code} | {r.text[:500]}")
+            logger.info(f"✅ Telegram Bot API social [{i}/{len(chat_ids)}] {chat_id}")
+
     async def send_social_post(self, text: str):
         cfg = self.cfg_getter()
         if not cfg.enable_telegram_social_post:
+            return
+
+        bot_token = (getattr(cfg, "telegram_bot_token", "") or os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
+        bot_chat_ids = parse_lines(getattr(cfg, "telegram_bot_chat_ids", "") or os.getenv("TELEGRAM_BOT_CHAT_IDS", ""))
+        if bot_token and bot_chat_ids:
+            await asyncio.to_thread(self.send_telegram_bot_api, text, bot_token, bot_chat_ids)
             return
 
         targets = []

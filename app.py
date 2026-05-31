@@ -753,8 +753,10 @@ def save_from_form(data: Dict[str, Any]) -> None:
         "ai_text_model", "image_policy", "image_model", "image_quality", "image_size",
         "block_scam_ai_model",
         "telegram_api_id", "telegram_api_hash", "telegram_session_name", "telegram_phone", "telegram_post_channel_url",
+        "telegram_bot_token", "telegram_bot_chat_ids",
         "telegram_source_channel", "telegram_target_channels",
-        "x_auth_token", "x_ct0", "facebook_cookie_json", "facebook_target_url",
+        "x_auth_token", "x_ct0", "x_api_access_token",
+        "facebook_cookie_json", "facebook_target_url", "facebook_page_id", "facebook_page_access_token",
         "block_scam_keywords", "block_scam_target_chats", "wp_publish_status",
         "erc8004_rpc_url", "erc8004_agent_registry", "erc8004_reputation_registry", "erc8004_validation_registry",
         "erc8004_validator_address", "erc8004_agent_id", "erc8004_evidence_base_url", "erc8004_private_key",
@@ -2074,6 +2076,8 @@ def login_content() -> str:
       <label>Session name</label><input name="telegram_session_name" value="{esc(cfg.telegram_session_name)}">
       <label>Phone</label><input name="telegram_phone" value="{esc(cfg.telegram_phone)}">
       <label>Telegram posting channel</label><input name="telegram_post_channel_url" value="{esc(getattr(cfg, 'telegram_post_channel_url', ''))}" placeholder="@yourchannel or https://t.me/yourchannel">
+      <label>Telegram Bot Token (preferred API posting)</label>{secret_input("telegram_bot_token", getattr(cfg, 'telegram_bot_token', ''), "Optional BotFather token") }
+      <label>Telegram Bot Chat IDs</label><textarea name="telegram_bot_chat_ids" placeholder="@yourchannel or -1001234567890, one per line">{esc(getattr(cfg, 'telegram_bot_chat_ids', ''))}</textarea>
     </div>
     <div class="actions"><button class="primary">Save Telegram</button></div>
   </form>
@@ -2085,6 +2089,7 @@ def login_content() -> str:
         <li>Open <b>API development tools</b>, create an app, then copy the <b>API ID</b> and <b>API Hash</b>.</li>
         <li>Paste the API ID, API Hash, phone number, and session name in this form.</li>
         <li>For social posting, enter a Telegram channel or group such as <code>@yourchannel</code> or <code>https://t.me/yourchannel</code>.</li>
+        <li>Preferred option: create a bot with <code>@BotFather</code>, add it as admin/member in the target channel/group, then paste the bot token and chat IDs. This avoids browser button-click issues.</li>
         <li>Click <b>Save Telegram</b>, then <b>Send Telegram Code</b>. Enter the code received in Telegram and your 2FA password if Telegram asks for it.</li>
         <li>Click <b>Test Session</b>. Make sure the Telegram account has permission to post, delete messages, and ban users in the target groups if BlockScam is enabled.</li>
       </ol>
@@ -2111,8 +2116,9 @@ def login_content() -> str:
   <form method="post" action="/save?next=login">
     <input type="hidden" name="bool__enable_x_post" value="1">
     <div class="grid">
-      <label>X auth_token</label>{secret_input("x_auth_token", cfg.x_auth_token)}
-      <label>X ct0</label>{secret_input("x_ct0", cfg.x_ct0)}
+      <label>X API Access Token (preferred)</label>{secret_input("x_api_access_token", getattr(cfg, 'x_api_access_token', ''), "OAuth 2.0 user token with tweet.write") }
+      <label>X auth_token (browser fallback)</label>{secret_input("x_auth_token", cfg.x_auth_token)}
+      <label>X ct0 (browser fallback)</label>{secret_input("x_ct0", cfg.x_ct0)}
     </div>
     <div class="checkrow"><label><input type="checkbox" name="enable_x_post" {checked('enable_x_post')}> Enable X Posting</label></div>
     <div class="actions"><button class="primary">Save X Cookie</button></div>
@@ -2121,10 +2127,10 @@ def login_content() -> str:
     <summary>X / Twitter setup guide</summary>
     <div class="setup-guide-body">
       <ol>
-        <li>Log in to X in a normal browser session.</li>
-        <li>Open the browser developer tools and copy the cookies named <code>auth_token</code> and <code>ct0</code> from the <code>x.com</code> domain.</li>
-        <li>Paste both values above, enable X posting, then save.</li>
-        <li>Click <b>Test X Post</b>. If the test fails, refresh the cookies because X may have expired the session.</li>
+        <li>Preferred option: create an X Developer app and generate an OAuth 2.0 user access token with <code>tweet.write</code>, <code>tweet.read</code>, and <code>users.read</code> scopes.</li>
+        <li>Paste the X API Access Token above. This posts through the official <code>POST /2/tweets</code> API and avoids UI selector issues.</li>
+        <li>Browser fallback: log in to X in a normal browser session and copy the cookies named <code>auth_token</code> and <code>ct0</code> from the <code>x.com</code> domain.</li>
+        <li>Enable X posting, save, then click <b>Test X Post</b>. If the browser fallback fails, refresh the cookies because X may have expired the session.</li>
       </ol>
       <p>Use a dedicated social account for automation. Platform UI changes can require selector updates.</p>
     </div>
@@ -2137,8 +2143,10 @@ def login_content() -> str:
   <form method="post" action="/save?next=login">
     <input type="hidden" name="bool__enable_facebook_post" value="1">
     <div class="grid">
-      <label>Facebook Target URL</label><input name="facebook_target_url" value="{esc(cfg.facebook_target_url)}">
-      <label>Facebook Cookie JSON</label>{secret_textarea("facebook_cookie_json", cfg.facebook_cookie_json)}
+      <label>Facebook Page ID (preferred Graph API)</label><input name="facebook_page_id" value="{esc(getattr(cfg, 'facebook_page_id', ''))}" placeholder="Your Page ID">
+      <label>Facebook Page Access Token</label>{secret_input("facebook_page_access_token", getattr(cfg, 'facebook_page_access_token', ''), "Page access token with publish permission") }
+      <label>Facebook Target URL (browser fallback)</label><input name="facebook_target_url" value="{esc(cfg.facebook_target_url)}">
+      <label>Facebook Cookie JSON (browser fallback)</label>{secret_textarea("facebook_cookie_json", cfg.facebook_cookie_json)}
     </div>
     <div class="checkrow"><label><input type="checkbox" name="enable_facebook_post" {checked('enable_facebook_post')}> Enable Facebook Posting</label></div>
     <div class="actions"><button class="primary">Save Facebook Cookie</button></div>
@@ -2147,10 +2155,9 @@ def login_content() -> str:
     <summary>Facebook setup guide</summary>
     <div class="setup-guide-body">
       <ol>
-        <li>Log in to Facebook in a normal browser session with the account that can post to your profile, page, or group.</li>
-        <li>Export Facebook cookies as JSON from your browser using a trusted cookie export extension or your browser developer tools.</li>
-        <li>Paste the full cookie JSON above. Keep it private because it can grant account access.</li>
-        <li>Enter the target URL where the bot should create the post, for example a profile, page, or group URL.</li>
+        <li>Preferred option: use Meta Graph API Page publishing. Create a Meta app, connect a Page, and generate a Page Access Token with permission to publish Page posts.</li>
+        <li>Paste the Page ID and Page Access Token above. This posts through Graph API and avoids Facebook UI selector issues.</li>
+        <li>Browser fallback: log in to Facebook in a normal browser session, export cookies as JSON, and enter the target URL where the bot should create the post.</li>
         <li>Enable Facebook posting, save, then click <b>Test Facebook Post</b>.</li>
       </ol>
       <p>If Facebook shows checkpoint, login, or permission screens, renew the cookie JSON and confirm that the account can post to the target URL manually.</p>
