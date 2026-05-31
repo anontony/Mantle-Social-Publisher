@@ -27,7 +27,7 @@ import feedparser
 
 from openai import OpenAI
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
@@ -60,6 +60,12 @@ PROJECT_DEMO_WALLETS = {
 }
 CREDIT_TOKEN_SYMBOL = "MFC"
 CONTENT_LANGUAGES = ["English", "Vietnamese", "Indonesian", "Thai", "Chinese", "Korean", "Japanese", "Spanish", "French", "Portuguese", "Hindi"]
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 def base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -3180,6 +3186,12 @@ class BlockScamService:
         # or aggressive invitation patterns.
         dangerous = matched_set - {"LINK_CONTEXT"}
         if not dangerous:
+            # Original BlockScam behavior can ban/delete plain links from normal
+            # users, while protected forwarded/channel posts are already skipped
+            # before this rule. Keep it configurable in case a community wants to
+            # allow user links.
+            if "LINK_CONTEXT" in matched_set and env_bool("BLOCKSCAM_DELETE_USER_LINKS", True):
+                return True, "USER_LINK_CONTEXT", 86, matched
             return False, "link_only_allowed", 20, matched
 
         score = min(100, 54 + len(dangerous) * 12 + (6 if "LINK_CONTEXT" in matched_set else 0))
@@ -3223,8 +3235,14 @@ class BlockScamService:
         skip_forwarded = os.getenv("BLOCKSCAM_SKIP_FORWARDED_POSTS", "1").strip().lower() not in {"0", "false", "no", "off"}
         if getattr(msg, "action", None):
             return True, "telegram_service_message"
-        if getattr(msg, "out", False):
+
+        # Telegram user-session messages sent by the same account are marked as
+        # outgoing. Production should usually ignore them, but demos/tests often
+        # send a scam sample from the same logged-in account. Allow deleting those
+        # samples when explicitly enabled; self-ban is still prevented later.
+        if getattr(msg, "out", False) and not env_bool("BLOCKSCAM_DELETE_OWN_TEST_MESSAGES", False):
             return True, "outgoing_or_own_message"
+
         if skip_forwarded and getattr(msg, "fwd_from", None):
             return True, "forwarded_or_linked_channel_post"
         if skip_forwarded and getattr(msg, "post", False):
@@ -3432,7 +3450,10 @@ MESSAGE:
         except Exception as e:
             logger.warning(f"Could not delete scam message ID {msg.id}: {e}")
 
-        if int(risk_score or 0) >= block_user_min_score:
+        is_own_test_message = bool(getattr(msg, "out", False))
+        if is_own_test_message:
+            logger.info("BlockScam self-test message was detected/deleted; self-ban is skipped by design. Test real ban with a second non-admin Telegram account.")
+        elif int(risk_score or 0) >= block_user_min_score:
             blocked = await self.block_sender(client, chat_entity, sender_id)
             if blocked and deleted:
                 action = "delete_message_and_block_user"
@@ -3559,7 +3580,8 @@ MESSAGE:
 
         from_user = getattr(message, "from_user", None)
         sender_id = getattr(from_user, "id", None)
-        if sender_id and await self.is_bot_api_user_admin(bot, chat_id, sender_id):
+        sender_is_admin = bool(sender_id and await self.is_bot_api_user_admin(bot, chat_id, sender_id))
+        if sender_is_admin and env_bool("BLOCKSCAM_SKIP_ADMINS", True):
             return
 
         text = " ".join([x for x in [getattr(message, "text", None), getattr(message, "caption", None)] if x]).strip()
@@ -3583,7 +3605,9 @@ MESSAGE:
         deleted = await self.safe_bot_api_delete(bot, chat_id, int(message_id))
         action = "delete_message" if deleted else "detect_only"
         blocked = False
-        if int(risk_score or 0) >= block_user_min_score and sender_id:
+        if sender_is_admin:
+            logger.info("BlockScam detected an admin/test message; delete may work, but admin ban is skipped by design. Test real ban with a second non-admin account.")
+        elif int(risk_score or 0) >= block_user_min_score and sender_id:
             blocked = await self.safe_bot_api_ban(bot, chat_id, int(sender_id))
             if blocked and deleted:
                 action = "delete_message_and_block_user"
@@ -3733,10 +3757,19 @@ MESSAGE:
             await client.disconnect()
             return
 
+        for entity, label in resolved_chats:
+            try:
+                peer_id = utils.get_peer_id(entity)
+            except Exception:
+                peer_id = getattr(entity, "id", "unknown")
+            logger.info(f"🛡️ BlockScam monitoring chat resolved | label={label} | peer_id={peer_id}")
+
         logger.info(f"🛡️ BlockScam real-time monitor started for {len(resolved_chats)} chat(s).")
 
         async def handle_event(event):
             try:
+                if not await event_is_allowed_chat(event):
+                    return
                 chat_entity = await event.get_chat()
                 chat_label = str(getattr(chat_entity, "username", None) or getattr(chat_entity, "title", None) or event.chat_id)
                 await self.process_candidate_message(
@@ -3752,6 +3785,8 @@ MESSAGE:
 
         async def handle_edit_event(event):
             try:
+                if not await event_is_allowed_chat(event):
+                    return
                 chat_entity = await event.get_chat()
                 chat_label = str(getattr(chat_entity, "username", None) or getattr(chat_entity, "title", None) or event.chat_id)
                 await self.process_candidate_message(
@@ -3766,8 +3801,47 @@ MESSAGE:
                 logger.error(f"BlockScam realtime edit handler error: {e}")
 
         chat_entities = [entity for entity, _ in resolved_chats]
-        client.add_event_handler(handle_event, events.NewMessage(chats=chat_entities))
-        client.add_event_handler(handle_edit_event, events.MessageEdited(chats=chat_entities))
+
+        allowed_peer_ids = set()
+        allowed_names = set()
+        for entity, label in resolved_chats:
+            try:
+                allowed_peer_ids.add(int(utils.get_peer_id(entity)))
+            except Exception:
+                pass
+            try:
+                allowed_names.add(self.normalize_chat_ref(getattr(entity, "username", "") or ""))
+                allowed_names.add(normalize_text(getattr(entity, "title", "") or "").strip())
+                allowed_names.add(self.normalize_chat_ref(label))
+            except Exception:
+                pass
+        allowed_names = {x for x in allowed_names if x}
+
+        async def event_is_allowed_chat(event) -> bool:
+            try:
+                if int(getattr(event, "chat_id", 0) or 0) in allowed_peer_ids:
+                    return True
+            except Exception:
+                pass
+            try:
+                ce = await event.get_chat()
+                uname = self.normalize_chat_ref(getattr(ce, "username", "") or "")
+                title = normalize_text(getattr(ce, "title", "") or "").strip()
+                return bool((uname and uname in allowed_names) or (title and title in allowed_names))
+            except Exception:
+                return False
+
+        catch_all_updates = os.getenv("BLOCKSCAM_CATCH_ALL_UPDATES", "1").strip().lower() not in {"0", "false", "no", "off"}
+        if catch_all_updates:
+            # Some Telegram hosted/session combinations miss updates when the
+            # Telethon handler is constrained by entity objects. Listen to all
+            # account updates and filter by resolved chat ID/title ourselves.
+            client.add_event_handler(handle_event, events.NewMessage())
+            client.add_event_handler(handle_edit_event, events.MessageEdited())
+            logger.info(f"🛡️ BlockScam catch-all update filter active for peer_ids={sorted(allowed_peer_ids)}.")
+        else:
+            client.add_event_handler(handle_event, events.NewMessage(chats=chat_entities))
+            client.add_event_handler(handle_edit_event, events.MessageEdited(chats=chat_entities))
 
         # Backfill a small recent window on startup only. After that, moderation is
         # event-driven and reacts to Telegram updates immediately instead of polling
