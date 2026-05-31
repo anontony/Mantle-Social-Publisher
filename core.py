@@ -286,7 +286,7 @@ class AppConfig:
     erc8004_agent_id: str = ""
     erc8004_evidence_base_url: str = ""
     erc8004_private_key: str = ""
-    erc8004_onchain_min_score: int = 90
+    erc8004_onchain_min_score: int = 70
 
 
 def apply_server_subscription_settings(cfg: AppConfig) -> AppConfig:
@@ -333,7 +333,7 @@ def apply_server_subscription_settings(cfg: AppConfig) -> AppConfig:
     try:
         cfg.erc8004_onchain_min_score = int((min_score_env if min_score_env is not None and min_score_env.strip() else str(cfg.erc8004_onchain_min_score)).strip())
     except Exception:
-        cfg.erc8004_onchain_min_score = 90
+        cfg.erc8004_onchain_min_score = 70
     try:
         cfg.monthly_mnt_amount = float(os.getenv("MONTHLY_MNT_AMOUNT", str(cfg.monthly_mnt_amount)).strip())
     except Exception:
@@ -1791,6 +1791,188 @@ class PlaywrightSocialService:
                 continue
         return None
 
+    def _facebook_composer_needles(self) -> List[str]:
+        return [
+            "what's on your mind", "what’s on your mind", "write something", "create post", "create a post",
+            "post something", "start a post", "photo/video",
+            "bạn đang nghĩ gì", "bạn nghĩ gì", "viết gì đó", "tạo bài viết", "ảnh/video",
+            "bắt đầu bài viết", "chia sẻ nội dung",
+        ]
+
+    async def _facebook_click_by_text_js(self, page, needles: Optional[List[str]] = None) -> str:
+        """Click a visible Facebook element by fuzzy text/aria-label matching.
+
+        Facebook's desktop composer is frequently rebuilt and normal CSS selectors
+        can miss the actual clickable ancestor. This JS fallback scans visible
+        nodes, then clicks the closest clickable ancestor. It is intentionally
+        limited to composer-related text to avoid clicking random feed controls.
+        """
+        needles = [str(x).lower() for x in (needles or self._facebook_composer_needles()) if str(x).strip()]
+        try:
+            return await page.evaluate(
+                """
+                (needles) => {
+                  const visible = (el) => {
+                    if (!el || !el.isConnected) return false;
+                    const st = window.getComputedStyle(el);
+                    if (!st || st.visibility === 'hidden' || st.display === 'none' || Number(st.opacity || 1) === 0) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 8 && r.height > 8 && r.bottom > 0 && r.right > 0 && r.top < window.innerHeight && r.left < window.innerWidth;
+                  };
+                  const norm = (s) => String(s || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+                  const clickable = (el) => {
+                    let cur = el;
+                    for (let i = 0; cur && i < 8; i++, cur = cur.parentElement) {
+                      const tag = (cur.tagName || '').toLowerCase();
+                      const role = cur.getAttribute('role') || '';
+                      if (['button','a','textarea'].includes(tag) || role === 'button' || role === 'textbox' || cur.getAttribute('contenteditable') === 'true') return cur;
+                    }
+                    return el;
+                  };
+                  const nodes = Array.from(document.querySelectorAll('div,span,a,button,textarea,[role="button"],[role="textbox"],[contenteditable="true"]'));
+                  for (const el of nodes) {
+                    if (!visible(el)) continue;
+                    const hay = norm([el.innerText, el.textContent, el.getAttribute('aria-label'), el.getAttribute('placeholder')].filter(Boolean).join(' '));
+                    if (!hay) continue;
+                    if (needles.some(n => hay.includes(n))) {
+                      const target = clickable(el);
+                      target.scrollIntoView({block: 'center', inline: 'center'});
+                      target.click();
+                      return hay.slice(0, 180);
+                    }
+                  }
+                  return '';
+                }
+                """,
+                needles,
+            ) or ""
+        except Exception:
+            return ""
+
+    async def _facebook_find_composer_box(self, page):
+        textboxes = [
+            'div[role="dialog"] div[role="textbox"][contenteditable="true"]',
+            'div[role="dialog"] div[contenteditable="true"]',
+            'div[role="dialog"] textarea',
+            'form textarea[name="xc_message"]',
+            'textarea[name="xc_message"]',
+            'textarea[name="status"]',
+            'textarea[name="message"]',
+            'textarea[name*="message"]',
+            'div[role="textbox"][contenteditable="true"]',
+            'div[role="textbox"]',
+            'div[contenteditable="true"][aria-label*="What" i]',
+            'div[contenteditable="true"][aria-label*="mind" i]',
+            'div[contenteditable="true"][aria-label*="Write" i]',
+            'div[contenteditable="true"][aria-label*="Bạn" i]',
+            'div[contenteditable="true"][aria-label*="Viết" i]',
+            'div[contenteditable="true"]',
+            'textarea',
+        ]
+        box = await self._find_visible_locator(page, textboxes, timeout=1800, prefer_last=True)
+        if box:
+            return box
+
+        # Fallback: locate any visible editable node via JS and mark it, then use a stable selector.
+        try:
+            marked = await page.evaluate(
+                """
+                () => {
+                  const visible = (el) => {
+                    const st = window.getComputedStyle(el);
+                    if (!st || st.visibility === 'hidden' || st.display === 'none') return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 20 && r.height > 15 && r.bottom > 0 && r.right > 0 && r.top < window.innerHeight && r.left < window.innerWidth;
+                  };
+                  const nodes = Array.from(document.querySelectorAll('div[contenteditable="true"],div[role="textbox"],textarea'));
+                  for (let i = nodes.length - 1; i >= 0; i--) {
+                    const el = nodes[i];
+                    if (!visible(el)) continue;
+                    el.setAttribute('data-msp-facebook-composer', '1');
+                    el.scrollIntoView({block:'center', inline:'center'});
+                    el.click();
+                    return true;
+                  }
+                  return false;
+                }
+                """
+            )
+            if marked:
+                loc = page.locator('[data-msp-facebook-composer="1"]').last
+                if await loc.count() > 0 and await loc.is_visible():
+                    return loc
+        except Exception:
+            pass
+        return None
+
+    async def _facebook_click_publish_button(self, page) -> bool:
+        selectors = [
+            'div[role="dialog"] div[aria-label="Post"][role="button"]',
+            'div[role="dialog"] div[aria-label="Đăng"][role="button"]',
+            'div[role="dialog"] div[aria-label*="Post" i][role="button"]',
+            'div[role="dialog"] div[aria-label*="Đăng" i][role="button"]',
+            'div[role="dialog"] div[aria-label*="Publish" i][role="button"]',
+            'div[role="dialog"] div[aria-label*="Share" i][role="button"]',
+            'div[role="dialog"] div[aria-label*="Chia sẻ" i][role="button"]',
+            'div[role="dialog"] div[role="button"]:has-text("Post")',
+            'div[role="dialog"] div[role="button"]:has-text("Đăng")',
+            'div[role="dialog"] [role="button"]:has-text("Publish")',
+            'div[role="dialog"] [role="button"]:has-text("Share")',
+            'div[role="dialog"] [role="button"]:has-text("Chia sẻ")',
+            'input[name="view_post"]',
+            'button[name="view_post"]',
+            'input[type="submit"][value="Post"]',
+            'input[type="submit"][value="Đăng"]',
+            'button:has-text("Post")',
+            'button:has-text("Đăng")',
+            'button:has-text("Share")',
+            'button:has-text("Chia sẻ")',
+            'div[aria-label="Post"][role="button"]',
+            'div[aria-label="Đăng"][role="button"]',
+            'div[aria-label*="Post" i][role="button"]',
+            'div[aria-label*="Đăng" i][role="button"]',
+        ]
+        clicked = await self._try_click_or_shortcut(page, selectors, platform="Facebook", timeout=10000, allow_shortcut=False)
+        if clicked:
+            return True
+
+        needles = ["post", "đăng", "publish", "share", "chia sẻ"]
+        try:
+            matched = await page.evaluate(
+                """
+                (needles) => {
+                  const visible = (el) => {
+                    const st = window.getComputedStyle(el);
+                    if (!st || st.visibility === 'hidden' || st.display === 'none' || Number(st.opacity || 1) === 0) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 18 && r.height > 18 && r.bottom > 0 && r.right > 0 && r.top < window.innerHeight && r.left < window.innerWidth;
+                  };
+                  const disabled = (el) => el.getAttribute('aria-disabled') === 'true' || el.getAttribute('disabled') !== null;
+                  const norm = (s) => String(s || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+                  const nodes = Array.from(document.querySelectorAll('div[role="button"],button,input[type="submit"],a[role="button"]'));
+                  for (let i = nodes.length - 1; i >= 0; i--) {
+                    const el = nodes[i];
+                    if (!visible(el) || disabled(el)) continue;
+                    const hay = norm([el.innerText, el.textContent, el.getAttribute('aria-label'), el.getAttribute('value')].filter(Boolean).join(' '));
+                    if (!hay) continue;
+                    if (needles.some(n => hay === n || hay.includes(n))) {
+                      el.scrollIntoView({block:'center', inline:'center'});
+                      el.click();
+                      return hay.slice(0, 120);
+                    }
+                  }
+                  return '';
+                }
+                """,
+                needles,
+            ) or ""
+            if matched:
+                logger.info(f"Facebook publish button clicked by JS fallback: {matched}")
+                return True
+        except Exception:
+            pass
+        return False
+
     async def _fill_facebook_box(self, page, box, text: str) -> None:
         await box.click()
         try:
@@ -1857,6 +2039,11 @@ class PlaywrightSocialService:
                         await page.wait_for_timeout(3500)
                     except Exception:
                         pass
+                else:
+                    matched = await self._facebook_click_by_text_js(page)
+                    if matched:
+                        logger.info(f"Facebook mobile/basic composer opened by text fallback: {matched}")
+                        await page.wait_for_timeout(3500)
 
                 textarea_selectors = [
                     'textarea[name="xc_message"]',
@@ -1869,6 +2056,9 @@ class PlaywrightSocialService:
                 ]
                 box = await self._find_visible_locator(page, textarea_selectors, timeout=2500, prefer_last=False)
                 if not box:
+                    box = await self._facebook_find_composer_box(page)
+                if not box:
+                    logger.info(f"Facebook mobile/basic: no composer input found on {url}")
                     continue
 
                 await self._fill_facebook_box(page, box, text)
@@ -1888,11 +2078,13 @@ class PlaywrightSocialService:
                 ]
 
                 submit = await self._find_visible_locator(page, submit_selectors, timeout=2000, prefer_last=True)
-                if not submit:
-                    continue
-
                 before_url = page.url
-                await submit.click()
+                if submit:
+                    await submit.click()
+                else:
+                    if not await self._facebook_click_publish_button(page):
+                        logger.info(f"Facebook mobile/basic: no submit button found on {url}")
+                        continue
                 await page.wait_for_timeout(6000)
 
                 # Basic Facebook may show a second confirmation screen. Click one more clear submit if present.
@@ -1955,48 +2147,28 @@ class PlaywrightSocialService:
                 pass
 
         if not opened:
+            matched = await self._facebook_click_by_text_js(page)
+            if matched:
+                logger.info(f"Facebook composer opened by text fallback: {matched}")
+                opened = True
+
+        if not opened:
             logger.warning("Could not find a clear composer button, trying direct input detection...")
 
         await page.wait_for_timeout(3500)
 
-        textboxes = [
-            'div[role="dialog"] div[role="textbox"][contenteditable="true"]',
-            'div[role="dialog"] div[contenteditable="true"]',
-            'div[role="textbox"][contenteditable="true"]',
-            'div[contenteditable="true"][aria-label*="What" i]',
-            'div[contenteditable="true"][aria-label*="mind" i]',
-            'div[contenteditable="true"][aria-label*="Bạn" i]',
-            'div[contenteditable="true"][aria-label*="Viết" i]',
-            'div[contenteditable="true"]',
-            'textarea',
-        ]
-
-        box = await self._find_visible_locator(page, textboxes, timeout=2500, prefer_last=True)
+        box = await self._facebook_find_composer_box(page)
         if not box:
+            logger.warning(f"Facebook desktop: no composer input found. title={await page.title()} url={page.url}")
             return False
 
         await self._fill_facebook_box(page, box, text)
         await page.wait_for_timeout(1200)
         await self._attach_image_if_possible(page, image_path, platform="Facebook")
 
-        post_buttons = [
-            'div[role="dialog"] div[aria-label="Post"][role="button"]',
-            'div[role="dialog"] div[aria-label="Đăng"][role="button"]',
-            'div[role="dialog"] div[aria-label*="Post" i][role="button"]',
-            'div[role="dialog"] div[aria-label*="Đăng" i][role="button"]',
-            'div[role="dialog"] div[aria-label*="Publish" i][role="button"]',
-            'div[role="dialog"] div[role="button"]:has-text("Post")',
-            'div[role="dialog"] div[role="button"]:has-text("Đăng")',
-            'div[role="dialog"] [role="button"]:has-text("Publish")',
-            'div[role="dialog"] [role="button"]:has-text("Share")',
-            'div[aria-label="Post"][role="button"]',
-            'div[aria-label="Đăng"][role="button"]',
-            'div[aria-label*="Post" i][role="button"]',
-            'div[aria-label*="Đăng" i][role="button"]',
-        ]
-
-        clicked = await self._try_click_or_shortcut(page, post_buttons, platform="Facebook", timeout=10000, allow_shortcut=False)
+        clicked = await self._facebook_click_publish_button(page)
         if not clicked:
+            logger.warning("Facebook desktop: composer input was filled but no reliable Post/Đăng button was found.")
             return False
 
         if not await self._confirm_facebook_publish(page):
@@ -2673,21 +2845,27 @@ class BlockScamService:
         compact = re.sub(r"[\s\W_]+", "", norm)
         matched: List[str] = []
 
+        # Link-only posts are common for legitimate channel/article forwards.
+        # Treat URL/Telegram links as context, not as a delete reason by itself.
+        link_like_keywords = {"t.me", "t.me/", "joinchat", "http", "https", "http://", "https://"}
+
         for k in keys:
             nk = normalize_text(k)
             nkc = re.sub(r"[\s\W_]+", "", nk)
+            label = f"keyword:{k}"
+            is_link_context = nk.strip().lower() in link_like_keywords or nk.startswith("http")
             if nk and nk in norm:
-                matched.append(f"keyword:{k}")
+                matched.append("LINK_CONTEXT" if is_link_context else label)
                 continue
             if nkc and nkc in compact:
-                matched.append(f"keyword:{k}")
+                matched.append("LINK_CONTEXT" if is_link_context else label)
                 continue
 
         strong_patterns = [
             ("FREE_USDT_LURE", r"(mien phi|miễn phí|free).{0,40}(usdt|usd|mnt|tien|tiền|airdrop|thuong|thưởng)"),
             ("CONTACT_ME_PATTERN", r"(lien he toi|liên hệ tôi|inbox|ib|pm|dm|nhan tin rieng|nhắn tin riêng)"),
             ("EARN_MONEY_LURE", r"(kiem|kiếm|nhan|nhận).{0,40}(\d+).{0,20}(usdt|usd|mnt|trieu|triệu)"),
-            ("TELEGRAM_LINK", r"(t\.me/|joinchat|https?://)"),
+            ("LINK_CONTEXT", r"(t\.me/|joinchat|https?://)"),
             ("URGENT_INVITE", r"(nhanh tay|co hoi|cơ hội|slot|suat|suất|bao loi|bao lời)"),
         ]
         for name, pattern in strong_patterns:
@@ -2698,14 +2876,43 @@ class BlockScamService:
         if not matched:
             return False, "clean_by_rules", 0, []
 
-        score = min(100, 55 + len(matched) * 12)
         matched_set = set(matched)
-        if "FREE_USDT_LURE" in matched_set and ("CONTACT_ME_PATTERN" in matched_set or "TELEGRAM_LINK" in matched_set):
+
+        # A normal article/channel post with only a link must never be deleted.
+        # It can still be escalated when combined with giveaway, phishing, contact-me,
+        # or aggressive invitation patterns.
+        dangerous = matched_set - {"LINK_CONTEXT"}
+        if not dangerous:
+            return False, "link_only_allowed", 20, matched
+
+        score = min(100, 52 + len(dangerous) * 12 + (6 if "LINK_CONTEXT" in matched_set else 0))
+        if "FREE_USDT_LURE" in matched_set and ("CONTACT_ME_PATTERN" in matched_set or "LINK_CONTEXT" in matched_set):
             score = max(score, 94)
-        if "EARN_MONEY_LURE" in matched_set and ("CONTACT_ME_PATTERN" in matched_set or "TELEGRAM_LINK" in matched_set):
+        if "EARN_MONEY_LURE" in matched_set and ("CONTACT_ME_PATTERN" in matched_set or "LINK_CONTEXT" in matched_set):
             score = max(score, 92)
+        if "CONTACT_ME_PATTERN" in matched_set and "URGENT_INVITE" in matched_set and "LINK_CONTEXT" in matched_set:
+            score = max(score, 88)
 
         return score >= 70, ",".join(matched), score, matched
+
+    def should_skip_protected_message(self, msg: Any) -> Tuple[bool, str]:
+        """Avoid moderating trusted channel forwards and service messages.
+
+        Linked-channel reposts, forwarded channel articles, and outgoing posts are
+        often legitimate project content. BlockScam should protect the community
+        from unsolicited user spam, not delete posts that an admin/channel already
+        forwarded into the monitored chat.
+        """
+        skip_forwarded = os.getenv("BLOCKSCAM_SKIP_FORWARDED_POSTS", "1").strip().lower() not in {"0", "false", "no", "off"}
+        if getattr(msg, "action", None):
+            return True, "telegram_service_message"
+        if getattr(msg, "out", False):
+            return True, "outgoing_or_own_message"
+        if skip_forwarded and getattr(msg, "fwd_from", None):
+            return True, "forwarded_or_linked_channel_post"
+        if skip_forwarded and getattr(msg, "post", False):
+            return True, "channel_post"
+        return False, ""
 
     def ai_risk(self, text: str) -> Tuple[bool, str, int, List[str]]:
         cfg = self.cfg_getter()
@@ -2812,7 +3019,8 @@ MESSAGE:
         while not stop_event.is_set():
             try:
                 cfg = self.cfg_getter()
-                min_onchain_score = int(getattr(cfg, "erc8004_onchain_min_score", 90) or 90)
+                min_onchain_score = int(getattr(cfg, "erc8004_onchain_min_score", 70) or 70)
+                block_user_min_score = int(os.getenv("BLOCKSCAM_BLOCK_USER_MIN_SCORE", "90") or "90")
                 for chat in chats:
                     try:
                         messages = await client.get_messages(chat, limit=30)
@@ -2827,6 +3035,12 @@ MESSAGE:
 
                             key = int(f"{abs(hash(str(chat))) % 100000}{msg.id % 100000}")
                             if db.is_sent_message(key):
+                                continue
+
+                            protected, protected_reason = self.should_skip_protected_message(msg)
+                            if protected:
+                                db.mark_sent_message(key)
+                                logger.info(f"🛡️ BlockScam skipped protected message ID {msg.id}: {protected_reason}")
                                 continue
 
                             db.mark_sent_message(key)
@@ -2850,7 +3064,7 @@ MESSAGE:
                             except Exception as e:
                                 logger.warning(f"Could not delete message: {e}")
 
-                            if risk_score >= min_onchain_score:
+                            if risk_score >= block_user_min_score:
                                 blocked = await self.block_sender(client, chat, sender_id)
                                 if blocked and deleted:
                                     action = "delete_message_and_block_user"
@@ -2873,6 +3087,8 @@ MESSAGE:
                                 tx_hash = ""
                                 if risk_score >= min_onchain_score:
                                     tx_hash = self.proof_service.submit_validation_request_if_ready(proof_hash)
+                                else:
+                                    logger.info(f"ERC-8004 on-chain proof skipped: score={risk_score} is below min={min_onchain_score}. Saved local proof only.")
                                 self.proof_service.save_local_proof(report, report_json, proof_hash, tx_hash)
                                 if tx_hash:
                                     db.update_moderation_tx(proof_hash, tx_hash)

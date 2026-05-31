@@ -214,6 +214,8 @@ def save_config_for_user(address: str, c: AppConfig) -> None:
     state = user_service_state.get(a)
     if state:
         state["cfg"] = c
+        if "holder" in state:
+            state["holder"]["cfg"] = c
 
 
 def activate_config_for_user(user: Optional[dict]) -> AppConfig:
@@ -785,7 +787,7 @@ def save_from_form(data: Dict[str, Any]) -> None:
             set_cfg_field(field, value)
     apply_server_subscription_settings(cfg)
 
-    int_defaults = {"min_score": 7, "post_interval_seconds": 17280, "posts_per_day": 5, "recent_hours": 6, "image_min_score": 9, "block_scam_ai_threshold": 7, "erc8004_onchain_min_score": 90}
+    int_defaults = {"min_score": 7, "post_interval_seconds": 17280, "posts_per_day": 5, "recent_hours": 6, "image_min_score": 9, "block_scam_ai_threshold": 7, "erc8004_onchain_min_score": 70}
     for field, default in int_defaults.items():
         if field in data:
             try:
@@ -2265,7 +2267,7 @@ def blockscam_content() -> str:
   </div>
   <label>Chats to Scan, one group/channel per line</label>
   <textarea name="block_scam_target_chats" placeholder="@your_group\n-1001234567890\nhttps://t.me/your_group">{esc(cfg.block_scam_target_chats)}</textarea>
-  <p class="help">BlockScam will not monitor anything until at least one Telegram group/channel is saved here. The logged-in Telegram account must be an admin with permission to delete messages and ban/restrict users.</p>
+  <p class="help">BlockScam will not monitor anything until at least one Telegram group/channel is saved here. The logged-in Telegram account must be an admin with permission to delete messages and ban/restrict users. Forwarded/channel-linked posts are skipped by default so your own channel reposts are not deleted.</p>
   <label>Scam Keywords, one keyword per line</label><textarea name="block_scam_keywords">{esc(cfg.block_scam_keywords)}</textarea>
 </div>
 
@@ -2284,9 +2286,10 @@ def blockscam_content() -> str:
   </div>
   <div class="grid">
     <label>Proof Writer Private Key</label>{secret_input('erc8004_private_key', getattr(cfg, 'erc8004_private_key', ''), '0x... fresh gas wallet only')}
-    <label>On-chain Min Score</label><input name="erc8004_onchain_min_score" value="{esc(getattr(cfg, 'erc8004_onchain_min_score', 90))}" placeholder="90">
+    <label>On-chain Min Score</label><input name="erc8004_onchain_min_score" value="{esc(getattr(cfg, 'erc8004_onchain_min_score', 70))}" placeholder="70">
   </div>
   <p class="help"><b>Security warning:</b> Never use your main wallet. Create a new wallet only for proof gas, fund it with a small amount of MNT, and paste that private key here.</p>
+  <p class="help">If a proof shows <b>local-only</b>, check that Verified On-chain Proof is enabled, Proof Writer Private Key is saved, the wallet has MNT gas, and the message score is greater than or equal to On-chain Min Score.</p>
   <div class="actions">
     <button class="primary" type="submit">Save BlockScam + Proof</button>
     <button formaction="/blockscam/test-proof" formmethod="post" type="submit">Test Proof</button>
