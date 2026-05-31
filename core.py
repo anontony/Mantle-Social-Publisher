@@ -1800,12 +1800,13 @@ class PlaywrightSocialService:
         ]
 
     async def _facebook_click_by_text_js(self, page, needles: Optional[List[str]] = None) -> str:
-        """Click a visible Facebook element by fuzzy text/aria-label matching.
+        """Click a visible Facebook composer trigger by fuzzy text/aria-label matching.
 
-        Facebook's desktop composer is frequently rebuilt and normal CSS selectors
-        can miss the actual clickable ancestor. This JS fallback scans visible
-        nodes, then clicks the closest clickable ancestor. It is intentionally
-        limited to composer-related text to avoid clicking random feed controls.
+        This helper used to scan broad div/span text. On Facebook Page admin
+        surfaces that can match a huge menu/container such as Professional tools,
+        ads, monetization, or share-dialog text. The hardened version only clicks
+        small, user-facing controls that look like a real create-post trigger and
+        rejects page-management, share, comment, and reply surfaces.
         """
         needles = [str(x).lower() for x in (needles or self._facebook_composer_needles()) if str(x).strip()]
         try:
@@ -1819,7 +1820,16 @@ class PlaywrightSocialService:
                     const r = el.getBoundingClientRect();
                     return r.width > 8 && r.height > 8 && r.bottom > 0 && r.right > 0 && r.top < window.innerHeight && r.left < window.innerWidth;
                   };
-                  const norm = (s) => String(s || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+                  const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+                  const rejectNeedles = [
+                    'comment', 'reply', 'bình luận', 'trả lời', 'send this to friends',
+                    'gửi nội dung này', 'post to your profile', 'đăng lên trang cá nhân',
+                    'professional tools', 'công cụ chuyên nghiệp', 'trình quản lý trang',
+                    'manage page', 'quản lý trang', 'insights', 'thông tin chi tiết',
+                    'planner', 'lập kế hoạch', 'monetization', 'kiếm tiền', 'ads center',
+                    'trung tâm quảng cáo', 'create ad', 'tạo quảng cáo', 'boost post',
+                    'quảng bá bài viết', 'instagram', 'settings', 'cài đặt'
+                  ];
                   const clickable = (el) => {
                     let cur = el;
                     for (let i = 0; cur && i < 8; i++, cur = cur.parentElement) {
@@ -1827,15 +1837,41 @@ class PlaywrightSocialService:
                       const role = cur.getAttribute('role') || '';
                       if (['button','a','textarea'].includes(tag) || role === 'button' || role === 'textbox' || cur.getAttribute('contenteditable') === 'true') return cur;
                     }
-                    return el;
+                    return null;
                   };
-                  const nodes = Array.from(document.querySelectorAll('div,span,a,button,textarea,[role="button"],[role="textbox"],[contenteditable="true"]'));
+                  const ownText = (el) => {
+                    const pieces = [];
+                    for (const node of Array.from(el.childNodes || [])) {
+                      if (node.nodeType === Node.TEXT_NODE) pieces.push(node.textContent || '');
+                    }
+                    return norm(pieces.join(' '));
+                  };
+                  const nodes = Array.from(document.querySelectorAll('a,button,textarea,[role="button"],[role="textbox"],[contenteditable="true"],div,span'));
                   for (const el of nodes) {
                     if (!visible(el)) continue;
-                    const hay = norm([el.innerText, el.textContent, el.getAttribute('aria-label'), el.getAttribute('placeholder')].filter(Boolean).join(' '));
+                    const tag = (el.tagName || '').toLowerCase();
+                    const role = el.getAttribute('role') || '';
+                    const direct = norm([
+                      ownText(el),
+                      el.getAttribute('aria-label'),
+                      el.getAttribute('placeholder'),
+                      el.getAttribute('title'),
+                    ].filter(Boolean).join(' '));
+                    const full = norm([el.innerText, el.textContent].filter(Boolean).join(' '));
+                    const hay = direct || full;
                     if (!hay) continue;
-                    if (needles.some(n => hay.includes(n))) {
+                    if (rejectNeedles.some(n => hay.includes(n))) continue;
+
+                    // Do not click giant layout containers whose innerText happens
+                    // to contain a composer phrase somewhere inside the Page UI.
+                    if (['div','span'].includes(tag) && role !== 'button' && role !== 'textbox' && direct.length === 0) continue;
+                    if (hay.length > 220 && !['textarea'].includes(tag) && role !== 'textbox') continue;
+
+                    if (needles.some(n => hay === n || hay.includes(n))) {
                       const target = clickable(el);
+                      if (!target || !visible(target)) continue;
+                      const targetText = norm([target.innerText, target.textContent, target.getAttribute('aria-label')].filter(Boolean).join(' '));
+                      if (rejectNeedles.some(n => targetText.includes(n))) continue;
                       target.scrollIntoView({block: 'center', inline: 'center'});
                       target.click();
                       return hay.slice(0, 180);
@@ -1994,11 +2030,13 @@ class PlaywrightSocialService:
         return None
 
     async def _facebook_click_publish_button(self, page, *, require_dialog: bool = False, safe_root_only: bool = False) -> bool:
-        """Click the real Facebook publish button, not a comment/reply button.
+        """Click the real Facebook publish button, not a comment/reply/share button.
 
-        For desktop inline composers we only click inside the composer root that
-        was marked by _facebook_find_composer_box. This avoids accidentally
-        pressing a comment/reply submit button elsewhere on the page.
+        For inline composers, this function only searches inside the composer
+        root marked by _facebook_find_composer_box. It intentionally avoids broad
+        Share/Chia sẻ text because Facebook share dialogs contain phrases such as
+        "send this to friends or post to your profile", which are not Page publish
+        buttons.
         """
         selectors = []
         if require_dialog:
@@ -2007,14 +2045,25 @@ class PlaywrightSocialService:
                 'div[role="dialog"] div[aria-label="Đăng"][role="button"]',
                 'div[role="dialog"] div[aria-label*="Post" i][role="button"]',
                 'div[role="dialog"] div[aria-label*="Đăng" i][role="button"]',
-                'div[role="dialog"] div[aria-label*="Publish" i][role="button"]',
-                'div[role="dialog"] div[aria-label*="Share" i][role="button"]',
-                'div[role="dialog"] div[aria-label*="Chia sẻ" i][role="button"]',
                 'div[role="dialog"] div[role="button"]:has-text("Post")',
                 'div[role="dialog"] div[role="button"]:has-text("Đăng")',
-                'div[role="dialog"] [role="button"]:has-text("Publish")',
-                'div[role="dialog"] [role="button"]:has-text("Share")',
-                'div[role="dialog"] [role="button"]:has-text("Chia sẻ")',
+                'div[role="dialog"] button:has-text("Post")',
+                'div[role="dialog"] button:has-text("Đăng")',
+            ])
+        elif safe_root_only:
+            selectors.extend([
+                '[data-msp-facebook-composer-root="1"] div[aria-label="Post"][role="button"]',
+                '[data-msp-facebook-composer-root="1"] div[aria-label="Đăng"][role="button"]',
+                '[data-msp-facebook-composer-root="1"] div[aria-label*="Post" i][role="button"]',
+                '[data-msp-facebook-composer-root="1"] div[aria-label*="Đăng" i][role="button"]',
+                '[data-msp-facebook-composer-root="1"] div[role="button"]:has-text("Post")',
+                '[data-msp-facebook-composer-root="1"] div[role="button"]:has-text("Đăng")',
+                '[data-msp-facebook-composer-root="1"] button:has-text("Post")',
+                '[data-msp-facebook-composer-root="1"] button:has-text("Đăng")',
+                '[data-msp-facebook-composer-root="1"] input[name="view_post"]',
+                '[data-msp-facebook-composer-root="1"] button[name="view_post"]',
+                '[data-msp-facebook-composer-root="1"] input[type="submit"][value="Post"]',
+                '[data-msp-facebook-composer-root="1"] input[type="submit"][value="Đăng"]',
             ])
         else:
             selectors.extend([
@@ -2024,8 +2073,6 @@ class PlaywrightSocialService:
                 'input[type="submit"][value="Đăng"]',
                 'button:has-text("Post")',
                 'button:has-text("Đăng")',
-                'button:has-text("Share")',
-                'button:has-text("Chia sẻ")',
                 'div[role="dialog"] div[aria-label="Post"][role="button"]',
                 'div[role="dialog"] div[aria-label="Đăng"][role="button"]',
                 'div[role="dialog"] div[aria-label*="Post" i][role="button"]',
@@ -2039,7 +2086,7 @@ class PlaywrightSocialService:
         try:
             matched = await page.evaluate(
                 """
-                ({ requireDialog }) => {
+                ({ requireDialog, safeRootOnly }) => {
                   const visible = (el) => {
                     if (!el || !el.isConnected) return false;
                     const st = window.getComputedStyle(el);
@@ -2048,31 +2095,77 @@ class PlaywrightSocialService:
                     return r.width > 18 && r.height > 18 && r.bottom > 0 && r.right > 0 && r.top < window.innerHeight && r.left < window.innerWidth;
                   };
                   const disabled = (el) => el.getAttribute('aria-disabled') === 'true' || el.getAttribute('disabled') !== null;
-                  const norm = (s) => String(s || '').toLowerCase().replace(/\\s+/g, ' ').trim();
-                  const publishNeedles = ['post', 'đăng', 'publish', 'share', 'chia sẻ'];
-                  const rejectNeedles = ['comment', 'reply', 'bình luận', 'trả lời'];
+                  const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+                  const exactPublish = ['post', 'đăng'];
+                  const rejectNeedles = [
+                    'comment', 'reply', 'bình luận', 'trả lời', 'share', 'chia sẻ',
+                    'send this to friends', 'gửi nội dung này', 'post to your profile',
+                    'đăng lên trang cá nhân', 'story', 'tin của bạn', 'messenger'
+                  ];
 
                   const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]')).filter(visible);
-                  const root = dialogs.length ? dialogs[dialogs.length - 1] : document;
-                  if (requireDialog && root === document) return '';
+                  let roots = [];
+                  if (requireDialog) {
+                    if (!dialogs.length) return '';
+                    roots = [dialogs[dialogs.length - 1]];
+                  } else if (safeRootOnly) {
+                    const marked = Array.from(document.querySelectorAll('[data-msp-facebook-composer-root="1"]')).filter(visible);
+                    if (!marked.length) return '';
+                    const composerNeedles = [
+                      "what's on your mind", "what’s on your mind", 'write something',
+                      'create post', 'create a post', 'bạn đang nghĩ gì', 'viết gì đó',
+                      'tạo bài viết', 'bắt đầu bài viết'
+                    ];
+                    const rootReject = [
+                      'professional tools', 'công cụ chuyên nghiệp', 'trình quản lý trang',
+                      'manage page', 'quản lý trang', 'insights', 'thông tin chi tiết',
+                      'planner', 'lập kế hoạch', 'monetization', 'kiếm tiền', 'ads center',
+                      'trung tâm quảng cáo', 'create ad', 'tạo quảng cáo', 'boost post',
+                      'quảng bá bài viết'
+                    ];
+                    const addRoot = (el) => {
+                      if (!el || !visible(el) || roots.includes(el)) return;
+                      const r = el.getBoundingClientRect();
+                      const txt = norm([el.getAttribute('aria-label'), el.innerText, el.textContent].filter(Boolean).join(' '));
+                      if (rootReject.some(n => txt.includes(n))) return;
+                      if (r.height > 1400 || r.width < 180) return;
+                      roots.push(el);
+                    };
+                    for (const base of marked) {
+                      addRoot(base);
+                      let cur = base.parentElement;
+                      for (let i = 0; cur && i < 8; i++, cur = cur.parentElement) {
+                        const txt = norm([cur.getAttribute('aria-label'), cur.innerText, cur.textContent].filter(Boolean).join(' '));
+                        if (composerNeedles.some(n => txt.includes(n))) addRoot(cur);
+                      }
+                    }
+                    if (!roots.length) return '';
+                  } else if (dialogs.length) {
+                    roots = [dialogs[dialogs.length - 1]];
+                  } else {
+                    roots = [document];
+                  }
 
-                  const nodes = Array.from(root.querySelectorAll('div[role="button"],button,input[type="submit"],a[role="button"]'));
-                  for (let i = nodes.length - 1; i >= 0; i--) {
-                    const el = nodes[i];
-                    if (!visible(el) || disabled(el)) continue;
-                    const hay = norm([el.innerText, el.textContent, el.getAttribute('aria-label'), el.getAttribute('value')].filter(Boolean).join(' '));
-                    if (!hay) continue;
-                    if (rejectNeedles.some(n => hay.includes(n))) continue;
-                    if (publishNeedles.some(n => hay === n || hay.includes(n))) {
-                      el.scrollIntoView({block:'center', inline:'center'});
-                      el.click();
-                      return hay.slice(0, 120);
+                  for (const root of roots) {
+                    const nodes = Array.from(root.querySelectorAll('div[role="button"],button,input[type="submit"],a[role="button"]'));
+                    for (let i = nodes.length - 1; i >= 0; i--) {
+                      const el = nodes[i];
+                      if (!visible(el) || disabled(el)) continue;
+                      const hay = norm([el.innerText, el.textContent, el.getAttribute('aria-label'), el.getAttribute('value'), el.getAttribute('title')].filter(Boolean).join(' '));
+                      if (!hay) continue;
+                      if (hay.length > 80) continue;
+                      if (rejectNeedles.some(n => hay.includes(n))) continue;
+                      if (exactPublish.some(n => hay === n || hay.startsWith(n + ' '))) {
+                        el.scrollIntoView({block:'center', inline:'center'});
+                        el.click();
+                        return hay.slice(0, 80);
+                      }
                     }
                   }
                   return '';
                 }
                 """,
-                {"requireDialog": bool(require_dialog)},
+                {"requireDialog": bool(require_dialog), "safeRootOnly": bool(safe_root_only)},
             ) or ""
             if matched:
                 logger.info(f"Facebook publish button clicked by safe JS fallback: {matched}")
@@ -2148,10 +2241,10 @@ class PlaywrightSocialService:
                     except Exception:
                         pass
                 else:
-                    matched = await self._facebook_click_by_text_js(page)
-                    if matched:
-                        logger.info(f"Facebook mobile/basic composer opened by text fallback: {matched}")
-                        await page.wait_for_timeout(3500)
+                    # Do not click broad Page admin/menu text on mobile. If a real
+                    # composer trigger is not visible, skip this URL and let desktop
+                    # handle the safer create-post flow.
+                    logger.info(f"Facebook mobile/basic: no trusted composer trigger found on {url}")
 
                 textarea_selectors = [
                     'textarea[name="xc_message"]',
@@ -2169,6 +2262,19 @@ class PlaywrightSocialService:
                     logger.info(f"Facebook mobile/basic: no composer input found on {url}")
                     continue
 
+                # Mark the nearest form/container as the trusted composer root so
+                # the submit fallback cannot click share/comment controls elsewhere.
+                try:
+                    await box.evaluate("""
+                    el => {
+                      document.querySelectorAll('[data-msp-facebook-composer-root="1"]').forEach(x => x.removeAttribute('data-msp-facebook-composer-root'));
+                      const root = el.closest('form') || el.closest('[role="dialog"]') || el.parentElement;
+                      if (root) root.setAttribute('data-msp-facebook-composer-root', '1');
+                    }
+                    """)
+                except Exception:
+                    pass
+
                 await self._fill_facebook_box(page, box, text)
                 await page.wait_for_timeout(800)
 
@@ -2176,13 +2282,12 @@ class PlaywrightSocialService:
                 await self._attach_image_if_possible(page, image_path, platform="Facebook mobile/basic")
 
                 submit_selectors = [
-                    'input[name="view_post"]',
-                    'button[name="view_post"]',
-                    'input[type="submit"][value="Post"]',
-                    'input[type="submit"][value="Đăng"]',
-                    'button:has-text("Post")',
-                    'button:has-text("Đăng")',
-                    'input[type="submit"]',
+                    '[data-msp-facebook-composer-root="1"] input[name="view_post"]',
+                    '[data-msp-facebook-composer-root="1"] button[name="view_post"]',
+                    '[data-msp-facebook-composer-root="1"] input[type="submit"][value="Post"]',
+                    '[data-msp-facebook-composer-root="1"] input[type="submit"][value="Đăng"]',
+                    '[data-msp-facebook-composer-root="1"] button:has-text("Post")',
+                    '[data-msp-facebook-composer-root="1"] button:has-text("Đăng")',
                 ]
 
                 submit = await self._find_visible_locator(page, submit_selectors, timeout=2000, prefer_last=True)
@@ -2190,8 +2295,8 @@ class PlaywrightSocialService:
                 if submit:
                     await submit.click()
                 else:
-                    if not await self._facebook_click_publish_button(page):
-                        logger.info(f"Facebook mobile/basic: no submit button found on {url}")
+                    if not await self._facebook_click_publish_button(page, safe_root_only=True):
+                        logger.info(f"Facebook mobile/basic: no trusted submit button found on {url}")
                         continue
                 await page.wait_for_timeout(6000)
 
