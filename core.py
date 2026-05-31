@@ -27,7 +27,7 @@ import feedparser
 
 from openai import OpenAI
 
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
@@ -3069,7 +3069,7 @@ class BlockScamService:
     def rule_based_risk(self, text: str) -> Tuple[bool, str, int, List[str]]:
         cfg = self.cfg_getter()
         keys = parse_lines(cfg.block_scam_keywords)
-        norm = normalize_text(text)
+        norm = normalize_text(text or "")
         compact = re.sub(r"[\s\W_]+", "", norm)
         matched: List[str] = []
 
@@ -3090,14 +3090,27 @@ class BlockScamService:
                 continue
 
         strong_patterns = [
-            ("FREE_USDT_LURE", r"(mien phi|miễn phí|free).{0,40}(usdt|usd|mnt|tien|tiền|airdrop|thuong|thưởng)"),
-            ("CONTACT_ME_PATTERN", r"(lien he toi|liên hệ tôi|inbox|ib|pm|dm|nhan tin rieng|nhắn tin riêng)"),
-            ("EARN_MONEY_LURE", r"(kiem|kiếm|nhan|nhận).{0,40}(\d+).{0,20}(usdt|usd|mnt|trieu|triệu)"),
-            ("LINK_CONTEXT", r"(t\.me/|joinchat|https?://)"),
-            ("URGENT_INVITE", r"(nhanh tay|co hoi|cơ hội|slot|suat|suất|bao loi|bao lời)"),
+            ("FREE_USDT_LURE", r"(mien phi|miễn phí|free|qua tang|quà tặng|airdrop).{0,45}(usdt|usd|mnt|tien|tiền|airdrop|thuong|thưởng|coin|token)"),
+            ("FREE_USDT_LURE", r"(usdt|usd|mnt|coin|token|airdrop|thuong|thưởng).{0,45}(mien phi|miễn phí|free|qua tang|quà tặng)"),
+            ("FREE_CRYPTO_CLAIM", r"(nhan|nhận|claim|lay|lấy|rut|rút).{0,45}(usdt|usd|mnt|coin|token|airdrop).{0,45}(free|mien phi|miễn phí|thuong|thưởng|qua|quà)?"),
+            ("CONTACT_ME_PATTERN", r"(lien he toi|liên hệ tôi|in\s*b\s*o\s*x|inbox|ib|pm|dm|nhan tin rieng|nhắn tin riêng|nhan tin|nhắn tin|inb\s*ox)"),
+            ("EARN_MONEY_LURE", r"(kiem|kiếm|nhan|nhận|lay|lấy).{0,45}(\d+|usdt|usd|mnt).{0,25}(usdt|usd|mnt|trieu|triệu|free|mien phi|miễn phí)"),
+            ("LINK_CONTEXT", r"(t\.me/|joinchat|https?://|bit\.ly|tinyurl|shorturl|cutt\.ly)"),
+            ("URGENT_INVITE", r"(nhanh tay|co hoi|cơ hội|slot|suat|suất|bao loi|bao lời|limited|gioi han|giới hạn)"),
+            ("SEED_PRIVATE_KEY_PHISH", r"(seed phrase|private key|khoa rieng|khóa riêng|12 tu|12 từ|24 tu|24 từ|connect wallet|xac minh vi|xác minh ví)"),
         ]
         for name, pattern in strong_patterns:
             if re.search(pattern, norm, re.I):
+                matched.append(name)
+
+        # Compact matching catches obfuscated bait such as "inb ox để nhận usd t free".
+        compact_patterns = [
+            ("CONTACT_ME_PATTERN", r"(inbox|ib|pm|dm|nhantin|lienhe)"),
+            ("FREE_USDT_LURE", r"(freeusdt|usdtfree|nhanusdt|nhanusd|nhanmnt|claimusdt|claimairdrop)"),
+            ("SEED_PRIVATE_KEY_PHISH", r"(seedphrase|privatekey|12tu|24tu|connectwallet|xacminhvi)"),
+        ]
+        for name, pattern in compact_patterns:
+            if re.search(pattern, compact, re.I):
                 matched.append(name)
 
         matched = list(dict.fromkeys(matched))
@@ -3113,11 +3126,15 @@ class BlockScamService:
         if not dangerous:
             return False, "link_only_allowed", 20, matched
 
-        score = min(100, 52 + len(dangerous) * 12 + (6 if "LINK_CONTEXT" in matched_set else 0))
+        score = min(100, 54 + len(dangerous) * 12 + (6 if "LINK_CONTEXT" in matched_set else 0))
         if "FREE_USDT_LURE" in matched_set and ("CONTACT_ME_PATTERN" in matched_set or "LINK_CONTEXT" in matched_set):
+            score = max(score, 95)
+        if "FREE_CRYPTO_CLAIM" in matched_set and ("CONTACT_ME_PATTERN" in matched_set or "LINK_CONTEXT" in matched_set or "FREE_USDT_LURE" in matched_set):
             score = max(score, 94)
         if "EARN_MONEY_LURE" in matched_set and ("CONTACT_ME_PATTERN" in matched_set or "LINK_CONTEXT" in matched_set):
             score = max(score, 92)
+        if "SEED_PRIVATE_KEY_PHISH" in matched_set:
+            score = max(score, 96)
         if "CONTACT_ME_PATTERN" in matched_set and "URGENT_INVITE" in matched_set and "LINK_CONTEXT" in matched_set:
             score = max(score, 88)
 
@@ -3198,7 +3215,25 @@ MESSAGE:
             return True, f"ai_score:{ai_score} {ai_reason}", ai_score, ai_matched or ["AI_SCAM_DETECTION"]
         return False, f"allowed ai_score:{ai_score} {ai_reason}", ai_score, ai_matched
 
-    async def block_sender(self, client: TelegramClient, chat: str, sender_id: Any) -> bool:
+    async def should_delete_message_async(self, text: str) -> Tuple[bool, str, int, List[str]]:
+        # Run rules immediately. Only the optional AI check is moved to a worker
+        # thread so slow API calls never block real-time Telegram event handling.
+        risky, reason, score, matched = self.rule_based_risk(text)
+        if risky:
+            return True, reason, score, matched
+        ai_delete, ai_reason, ai_score, ai_matched = await asyncio.to_thread(self.ai_risk, text)
+        if ai_delete:
+            return True, f"ai_score:{ai_score} {ai_reason}", ai_score, ai_matched or ["AI_SCAM_DETECTION"]
+        return False, f"allowed ai_score:{ai_score} {ai_reason}", ai_score, ai_matched
+
+    def stable_message_key(self, chat_ref: Any, message_id: int) -> int:
+        # Python's built-in hash is randomized per process. Use a stable hash so
+        # duplicate tracking survives restarts and redeploys.
+        digest = hashlib.sha256(str(chat_ref).encode("utf-8", errors="ignore")).hexdigest()
+        chat_num = int(digest[:8], 16) % 4_000_000_000
+        return int(chat_num * 1_000_000_000 + int(message_id or 0))
+
+    async def block_sender(self, client: TelegramClient, chat: Any, sender_id: Any) -> bool:
         if not sender_id:
             logger.warning("No sender_id found, cannot block user.")
             return False
@@ -3215,6 +3250,145 @@ MESSAGE:
         except Exception as e:
             logger.warning(f"kick_participant failed: {e}")
             return False
+
+    def create_moderation_proof_sync(
+        self,
+        *,
+        chat: str,
+        message_id: int,
+        sender_id: Any,
+        text: str,
+        action: str,
+        risk_score: int,
+        risk_reason: str,
+        matched_rules: List[str],
+        min_onchain_score: int,
+    ) -> Tuple[str, str]:
+        report, report_json, proof_hash = self.proof_service.build_report(
+            chat=str(chat),
+            message_id=int(message_id),
+            sender_id=sender_id,
+            text=text,
+            action=action,
+            risk_score=int(risk_score or 0),
+            risk_reason=risk_reason,
+            matched_rules=matched_rules,
+        )
+        tx_hash = ""
+        if int(risk_score or 0) >= int(min_onchain_score or 0):
+            tx_hash = self.proof_service.submit_validation_request_if_ready(proof_hash)
+        else:
+            logger.info(f"ERC-8004 on-chain proof skipped: score={risk_score} is below min={min_onchain_score}. Saved local proof only.")
+        self.proof_service.save_local_proof(report, report_json, proof_hash, tx_hash)
+        if tx_hash:
+            db.update_moderation_tx(proof_hash, tx_hash)
+        return proof_hash, tx_hash
+
+    async def process_candidate_message(
+        self,
+        *,
+        client: TelegramClient,
+        chat_entity: Any,
+        chat_label: str,
+        msg: Any,
+        processed_cache: set,
+        verbose: bool = False,
+    ) -> None:
+        if not msg or not getattr(msg, "id", None):
+            return
+
+        key = self.stable_message_key(chat_label, int(msg.id))
+        if key in processed_cache:
+            return
+        processed_cache.add(key)
+        if len(processed_cache) > 10000:
+            processed_cache.clear()
+
+        # DB repeat check is best-effort. Real-time moderation must not stall when
+        # SQLite is busy because another worker is saving settings/logs/proofs.
+        try:
+            if db.is_sent_message(key):
+                return
+        except Exception as e:
+            if verbose:
+                logger.warning(f"BlockScam duplicate check skipped due DB busy/error: {e}")
+
+        protected, protected_reason = self.should_skip_protected_message(msg)
+        if protected:
+            try:
+                db.mark_sent_message(key)
+            except Exception:
+                pass
+            if verbose:
+                logger.info(f"🛡️ BlockScam skipped protected message ID {msg.id}: {protected_reason}")
+            return
+
+        text = (
+            getattr(msg, "raw_text", None)
+            or getattr(msg, "message", None)
+            or getattr(msg, "text", None)
+            or ""
+        ).strip()
+        if not text:
+            try:
+                db.mark_sent_message(key)
+            except Exception:
+                pass
+            return
+
+        try:
+            db.mark_sent_message(key)
+        except Exception:
+            pass
+
+        should_delete, risk_reason, risk_score, matched_rules = await self.should_delete_message_async(text)
+        if not should_delete:
+            return
+
+        logger.warning(f"🚫 BlockScam detected scam | chat={chat_label} | score={risk_score} | reason={risk_reason} | text={text[:100]}")
+
+        cfg = self.cfg_getter()
+        min_onchain_score = int(getattr(cfg, "erc8004_onchain_min_score", 70) or 70)
+        block_user_min_score = int(os.getenv("BLOCKSCAM_BLOCK_USER_MIN_SCORE", "90") or "90")
+
+        action = "detect_only"
+        deleted = False
+        blocked = False
+        sender_id = getattr(msg, "sender_id", None)
+
+        try:
+            await client.delete_messages(chat_entity, int(msg.id))
+            deleted = True
+            action = "delete_message"
+            logger.info(f"✅ BlockScam deleted scam message ID {msg.id}.")
+        except Exception as e:
+            logger.warning(f"Could not delete scam message ID {msg.id}: {e}")
+
+        if int(risk_score or 0) >= block_user_min_score:
+            blocked = await self.block_sender(client, chat_entity, sender_id)
+            if blocked and deleted:
+                action = "delete_message_and_block_user"
+            elif blocked:
+                action = "block_user"
+            elif deleted:
+                action = "delete_message_block_failed"
+
+        try:
+            proof_hash, tx_hash = await asyncio.to_thread(
+                self.create_moderation_proof_sync,
+                chat=str(chat_label),
+                message_id=int(msg.id),
+                sender_id=sender_id,
+                text=text,
+                action=action,
+                risk_score=int(risk_score or 0),
+                risk_reason=risk_reason,
+                matched_rules=matched_rules,
+                min_onchain_score=min_onchain_score,
+            )
+            logger.info(f"🧾 BlockScam proof created | score={risk_score} | hash={proof_hash} | tx={tx_hash or 'local-only'}")
+        except Exception as e:
+            logger.warning(f"Could not create BlockScam proof: {e}")
 
     async def run_basic_monitor(self, stop_event: threading.Event):
         cfg = self.cfg_getter()
@@ -3242,99 +3416,78 @@ MESSAGE:
             await client.disconnect()
             return
 
-        logger.info("🛡️ BlockScam monitor started with moderation proof support.")
+        verbose = os.getenv("BLOCKSCAM_VERBOSE", "0").strip().lower() in {"1", "true", "yes", "on"}
+        startup_backfill_limit = max(0, int(os.getenv("BLOCKSCAM_STARTUP_BACKFILL_LIMIT", "20") or "20"))
+        health_interval = max(0, int(os.getenv("BLOCKSCAM_HEALTH_LOG_SECONDS", "0") or "0"))
+        processed_cache: set = set()
+        resolved_chats: List[Tuple[Any, str]] = []
 
-        while not stop_event.is_set():
+        for chat in chats:
             try:
-                cfg = self.cfg_getter()
-                min_onchain_score = int(getattr(cfg, "erc8004_onchain_min_score", 70) or 70)
-                block_user_min_score = int(os.getenv("BLOCKSCAM_BLOCK_USER_MIN_SCORE", "90") or "90")
-                for chat in chats:
-                    try:
-                        messages = await client.get_messages(chat, limit=30)
-
-                        for msg in messages:
-                            if not msg or not msg.id:
-                                continue
-
-                            text = msg.text or ""
-                            if not text:
-                                continue
-
-                            key = int(f"{abs(hash(str(chat))) % 100000}{msg.id % 100000}")
-                            if db.is_sent_message(key):
-                                continue
-
-                            protected, protected_reason = self.should_skip_protected_message(msg)
-                            if protected:
-                                db.mark_sent_message(key)
-                                logger.info(f"🛡️ BlockScam skipped protected message ID {msg.id}: {protected_reason}")
-                                continue
-
-                            db.mark_sent_message(key)
-
-                            should_delete, risk_reason, risk_score, matched_rules = self.should_delete_message(text)
-                            if not should_delete:
-                                continue
-
-                            logger.warning(f"🚫 Suspicious scam in {chat}: score={risk_score} reason={risk_reason} | {text[:100]}")
-
-                            action = "detect_only"
-                            deleted = False
-                            blocked = False
-                            sender_id = getattr(msg, "sender_id", None)
-
-                            try:
-                                await client.delete_messages(chat, msg.id)
-                                deleted = True
-                                action = "delete_message"
-                                logger.info("✅ Scam message deleted.")
-                            except Exception as e:
-                                logger.warning(f"Could not delete message: {e}")
-
-                            if risk_score >= block_user_min_score:
-                                blocked = await self.block_sender(client, chat, sender_id)
-                                if blocked and deleted:
-                                    action = "delete_message_and_block_user"
-                                elif blocked:
-                                    action = "block_user"
-                                elif deleted:
-                                    action = "delete_message_block_failed"
-
-                            try:
-                                report, report_json, proof_hash = self.proof_service.build_report(
-                                    chat=str(chat),
-                                    message_id=int(msg.id),
-                                    sender_id=sender_id,
-                                    text=text,
-                                    action=action,
-                                    risk_score=int(risk_score or 0),
-                                    risk_reason=risk_reason,
-                                    matched_rules=matched_rules,
-                                )
-                                tx_hash = ""
-                                if risk_score >= min_onchain_score:
-                                    tx_hash = self.proof_service.submit_validation_request_if_ready(proof_hash)
-                                else:
-                                    logger.info(f"ERC-8004 on-chain proof skipped: score={risk_score} is below min={min_onchain_score}. Saved local proof only.")
-                                self.proof_service.save_local_proof(report, report_json, proof_hash, tx_hash)
-                                if tx_hash:
-                                    db.update_moderation_tx(proof_hash, tx_hash)
-                                logger.info(f"🧾 BlockScam proof created | score={risk_score} | hash={proof_hash} | tx={tx_hash or 'local-only'}")
-                            except Exception as e:
-                                logger.warning(f"Could not create BlockScam proof: {e}")
-
-                    except Exception as e:
-                        logger.error(f"BlockScam chat error {chat}: {e}")
-
-                await asyncio.sleep(30)
-
+                entity = await client.get_entity(chat)
+                label = str(getattr(entity, "username", None) or getattr(entity, "title", None) or chat)
+                resolved_chats.append((entity, label))
             except Exception as e:
-                logger.error(f"BlockScam loop error: {e}")
-                await asyncio.sleep(10)
+                logger.error(f"BlockScam cannot access chat {chat}: {e}")
 
-        await client.disconnect()
-        logger.info("BlockScam stopped.")
+        if not resolved_chats:
+            logger.error("BlockScam has no accessible chats to monitor. Check chat IDs/usernames and Telegram admin permissions.")
+            await client.disconnect()
+            return
+
+        logger.info(f"🛡️ BlockScam real-time monitor started for {len(resolved_chats)} chat(s).")
+
+        async def handle_event(event):
+            try:
+                chat_entity = await event.get_chat()
+                chat_label = str(getattr(chat_entity, "username", None) or getattr(chat_entity, "title", None) or event.chat_id)
+                await self.process_candidate_message(
+                    client=client,
+                    chat_entity=chat_entity,
+                    chat_label=chat_label,
+                    msg=event.message,
+                    processed_cache=processed_cache,
+                    verbose=verbose,
+                )
+            except Exception as e:
+                logger.error(f"BlockScam realtime handler error: {e}")
+
+        chat_entities = [entity for entity, _ in resolved_chats]
+        client.add_event_handler(handle_event, events.NewMessage(chats=chat_entities))
+
+        # Backfill a small recent window on startup only. After that, moderation is
+        # event-driven and reacts to Telegram updates immediately instead of polling
+        # every 30 seconds.
+        if startup_backfill_limit > 0:
+            for entity, label in resolved_chats:
+                try:
+                    recent = await client.get_messages(entity, limit=startup_backfill_limit)
+                    for msg in reversed(recent):
+                        await self.process_candidate_message(
+                            client=client,
+                            chat_entity=entity,
+                            chat_label=label,
+                            msg=msg,
+                            processed_cache=processed_cache,
+                            verbose=verbose,
+                        )
+                except Exception as e:
+                    logger.warning(f"BlockScam startup backfill failed for {label}: {e}")
+
+        last_health = time.time()
+        try:
+            while not stop_event.is_set():
+                await asyncio.sleep(0.25)
+                if health_interval > 0 and time.time() - last_health >= health_interval:
+                    last_health = time.time()
+                    logger.info("🛡️ BlockScam real-time monitor alive.")
+        finally:
+            try:
+                client.remove_event_handler(handle_event)
+            except Exception:
+                pass
+            await client.disconnect()
+            logger.info("BlockScam stopped.")
 
 
 # =========================================================
