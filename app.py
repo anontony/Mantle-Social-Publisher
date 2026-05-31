@@ -922,6 +922,25 @@ def esc(value: Any) -> str:
     return html.escape(str(value or ""), quote=True)
 
 
+def public_base_url() -> str:
+    """Return the public app base URL used for proof links.
+
+    Railway may serve the app from an internal *.up.railway.app domain while
+    users and validators should open evidence through the public/custom domain.
+    Set ERC8004_EVIDENCE_BASE_URL to something like:
+    https://cignews.space/Mantle-Social-Publisher
+    """
+    base = (getattr(cfg, "erc8004_evidence_base_url", "") or os.getenv("APP_PUBLIC_BASE_URL", "") or "").strip()
+    return base.rstrip("/")
+
+
+def public_url(path: str) -> str:
+    """Build an absolute URL on the public/custom domain when configured."""
+    base = public_base_url()
+    clean_path = "/" + str(path or "").lstrip("/")
+    return f"{base}{clean_path}" if base else clean_path
+
+
 def checked(name: str) -> str:
     return "checked" if bool(getattr(cfg, name, False)) else ""
 
@@ -2295,7 +2314,7 @@ def blockscam_content() -> str:
   <div class="actions">
     <button class="primary" type="submit">Save BlockScam + Proof</button>
     <button formaction="/blockscam/test-proof" formmethod="post" type="submit">Test Proof</button>
-    <a class="button" href="/blockscam/proofs" target="_blank">View Proofs</a>
+    <a class="button" href="{esc(public_url('/blockscam/proofs'))}" target="_blank">View Proofs</a>
   </div>
 </div>
 
@@ -2760,10 +2779,10 @@ def blockscam_proofs(request: Request):
             """
         ).fetchall()
     items = []
-    base = (getattr(cfg, "erc8004_evidence_base_url", "") or "").strip().rstrip("/")
+    proofs_url = public_url("/blockscam/proofs")
     for row in rows:
         proof_hash = row["proof_hash"]
-        evidence_url = f"/proof/{esc(proof_hash)}"
+        evidence_url = public_url(f"/proof/{proof_hash}")
         tx = row["tx_hash"] or "local-only"
         tx_html = esc(tx)
         if str(tx).startswith("0x") and len(str(tx)) > 20:
@@ -2777,6 +2796,7 @@ def blockscam_proofs(request: Request):
     <div class="card">
       <h3>BlockScam Moderation Proofs</h3>
       <p class="help">These are local evidence hashes. Rows with a tx hash were also anchored through the configured ERC-8004 validation flow.</p>
+      <p class="help">Public proof base: <a href="{esc(proofs_url)}" target="_blank">{esc(public_base_url() or 'current app domain')}</a></p>
       <table style="width:100%;border-collapse:collapse;overflow-wrap:anywhere">
         <thead><tr><th align="left">Proof</th><th align="left">Action</th><th align="left">Score</th><th align="left">Tx</th><th align="left">Created</th></tr></thead>
         <tbody>{table}</tbody>
@@ -2788,9 +2808,9 @@ def blockscam_proofs(request: Request):
 
 @app.get("/proof/{proof_hash}", response_class=JSONResponse)
 def blockscam_proof_json(proof_hash: str, request: Request):
-    user = get_current_user(request)
-    if not user:
-        return JSONResponse({"error": "Connect wallet to view workspace proof evidence."}, status_code=401)
+    # Proof evidence is intentionally public and redacted: Telegram chat/user/message
+    # identifiers are stored as hashes and the message body is redacted before saving.
+    # This keeps on-chain evidence URIs verifiable from the configured public domain.
     with auth_conn() as conn:
         row = conn.execute(
             "SELECT proof_hash, report_json, tx_hash, created_at FROM moderation_proofs WHERE proof_hash=?",
@@ -2804,6 +2824,7 @@ def blockscam_proof_json(proof_hash: str, request: Request):
         report = {"raw": row["report_json"]}
     return JSONResponse({
         "proof_hash": row["proof_hash"],
+        "evidence_url": public_url(f"/proof/{row['proof_hash']}"),
         "report": report,
         "tx_hash": row["tx_hash"],
         "created_at": row["created_at"],

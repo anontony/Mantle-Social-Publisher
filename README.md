@@ -439,7 +439,7 @@ ERC8004_REPUTATION_REGISTRY=0x8004BAa17C55a88189AE136b182e5fdA19dE9b63
 ERC8004_VALIDATION_REGISTRY=0xYourValidationRegistry
 ERC8004_VALIDATOR_ADDRESS=0xYourValidatorAddress
 ERC8004_AGENT_ID=YourAgentId
-ERC8004_EVIDENCE_BASE_URL=https://your-railway-domain.up.railway.app
+ERC8004_EVIDENCE_BASE_URL=https://your-public-domain.com  # use your public/custom domain, not the internal Railway domain
 ERC8004_ONCHAIN_MIN_SCORE=90
 ```
 
@@ -612,7 +612,7 @@ ERC8004_REPUTATION_REGISTRY=0x8004BAa17C55a88189AE136b182e5fdA19dE9b63
 ERC8004_VALIDATION_REGISTRY=0xYourValidationRegistry
 ERC8004_VALIDATOR_ADDRESS=0xYourValidatorAddress
 ERC8004_AGENT_ID=YourAgentId
-ERC8004_EVIDENCE_BASE_URL=https://your-app.up.railway.app
+ERC8004_EVIDENCE_BASE_URL=https://your-public-domain.com  # use your public/custom domain, not the internal Railway domain
 ERC8004_ONCHAIN_MIN_SCORE=90
 ```
 
