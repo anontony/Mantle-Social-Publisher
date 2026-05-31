@@ -69,10 +69,11 @@ BASE_DIR = base_dir()
 RUNTIME_DIR = Path(os.getenv("RUNTIME_DIR", "/data" if Path("/data").exists() else str(BASE_DIR / "runtime")))
 SESSION_DIR = RUNTIME_DIR / "sessions"
 PROFILE_DIR = RUNTIME_DIR / "browser_profiles"
+SOCIAL_IMAGE_DIR = RUNTIME_DIR / "social_images"
 DB_PATH = RUNTIME_DIR / "app.db"
 CONFIG_PATH = RUNTIME_DIR / "config.json"
 
-for p in [RUNTIME_DIR, SESSION_DIR, PROFILE_DIR]:
+for p in [RUNTIME_DIR, SESSION_DIR, PROFILE_DIR, SOCIAL_IMAGE_DIR]:
     p.mkdir(parents=True, exist_ok=True)
 
 
@@ -554,6 +555,7 @@ class NewsWordPressService:
     def __init__(self, cfg_getter):
         self.cfg_getter = cfg_getter
         self.last_post_time = 0
+        self.last_uploaded_image_url = ""
 
     def get_openai(self) -> OpenAI:
         cfg = self.cfg_getter()
@@ -984,7 +986,23 @@ Visual direction:
             logger.error(f"🔥 Image generation error: {e}")
         return None
 
+    def save_social_image(self, img: Optional[bytes], title: str = "social-image") -> str:
+        """Persist the generated WordPress image so social posters can attach it too."""
+        if not img:
+            return ""
+        try:
+            safe_title = re.sub(r"[^a-zA-Z0-9_-]+", "-", (title or "social-image").strip()).strip("-")[:60]
+            digest = hashlib.sha256(img).hexdigest()[:12]
+            filename = f"{int(time.time())}-{safe_title or 'social-image'}-{digest}.png"
+            path = SOCIAL_IMAGE_DIR / filename
+            path.write_bytes(img)
+            return str(path)
+        except Exception as e:
+            logger.warning(f"Could not save social image attachment: {e}")
+            return ""
+
     def upload_image(self, img: Optional[bytes]) -> Optional[int]:
+        self.last_uploaded_image_url = ""
         if not img:
             return None
 
@@ -1007,7 +1025,9 @@ Visual direction:
             )
 
             if r.status_code in (200, 201):
-                media_id = r.json().get("id")
+                payload = r.json()
+                media_id = payload.get("id")
+                self.last_uploaded_image_url = str(payload.get("source_url") or payload.get("guid", {}).get("rendered") or "")
                 logger.info(f"✅ Featured image uploaded: media_id={media_id}")
                 return media_id
 
@@ -1137,7 +1157,9 @@ LINK:
 
         logger.info("🎨 Checking featured-image cost policy...")
         img = self.create_image(title_new, best_score)
+        image_path = self.save_social_image(img, title_new)
         img_id = self.upload_image(img)
+        image_url = self.last_uploaded_image_url
 
         logger.info("🚀 Publishing to WordPress...")
         wp_result = self.post_wp(title_new, article, img_id)
@@ -1155,6 +1177,8 @@ LINK:
             "article": article,
             "summary": summary,
             "link": link,
+            "image_path": image_path,
+            "image_url": image_url,
             "wp": wp_result
         }
 
@@ -1364,11 +1388,53 @@ class PlaywrightSocialService:
             return value
         return os.getenv(env_name or attr.upper(), "").strip()
 
-    def _x_post_text(self, text: str) -> str:
-        text = (text or "").strip()
-        if len(text) <= 280:
+    def _shorten_at_word(self, text: str, limit: int) -> str:
+        text = re.sub(r"\s+", " ", (text or "").strip())
+        if len(text) <= limit:
             return text
-        return text[:276].rstrip() + "…"
+        cut = text[: max(0, limit - 1)].rstrip()
+        if " " in cut:
+            cut = cut.rsplit(" ", 1)[0].rstrip()
+        return (cut or text[: max(0, limit - 1)].rstrip()) + "…"
+
+    def _x_post_text(self, text: str) -> str:
+        """Create a clean X-length post and preserve the article link when present."""
+        text = re.sub(r"\s+", " ", (text or "").strip())
+        urls = re.findall(r"https?://\S+", text)
+        url = urls[-1].rstrip(".,)") if urls else ""
+        body = re.sub(r"https?://\S+", "", text).strip()
+
+        if url:
+            limit = max(40, 280 - len(url) - 2)
+            body = self._shorten_at_word(body, limit)
+            final = f"{body}\n{url}".strip()
+        else:
+            final = self._shorten_at_word(body, 280)
+
+        return final[:280].rstrip()
+
+    def _telegram_caption(self, text: str) -> str:
+        text = (text or "").strip()
+        if len(text) <= 1024:
+            return text
+        urls = re.findall(r"https?://\S+", text)
+        url = urls[-1].rstrip(".,)") if urls else ""
+        body = re.sub(r"https?://\S+", "", text).strip()
+        if url:
+            body = self._shorten_at_word(body, max(80, 1024 - len(url) - 2))
+            return f"{body}\n{url}"[:1024].rstrip()
+        return self._shorten_at_word(text, 1024)
+
+    def _valid_image_path(self, image_path: str | None) -> str:
+        if not image_path:
+            return ""
+        try:
+            path = Path(str(image_path))
+            if path.exists() and path.is_file() and path.stat().st_size > 0:
+                return str(path)
+        except Exception:
+            pass
+        return ""
 
     def post_x_api(self, text: str, access_token: str):
         payload = {"text": self._x_post_text(text)}
@@ -1386,8 +1452,28 @@ class PlaywrightSocialService:
         logger.info("✅ Posted to X via API.")
         return r.json()
 
-    def post_facebook_graph_api(self, text: str, page_id: str, page_access_token: str):
+    def post_facebook_graph_api(self, text: str, page_id: str, page_access_token: str, image_path: str | None = None):
         version = os.getenv("META_GRAPH_API_VERSION", "v24.0").strip() or "v24.0"
+        image_path = self._valid_image_path(image_path)
+
+        if image_path:
+            url = f"https://graph.facebook.com/{version}/{page_id}/photos"
+            with open(image_path, "rb") as f:
+                r = requests.post(
+                    url,
+                    data={
+                        "message": (text or "").strip(),
+                        "access_token": page_access_token,
+                        "published": "true",
+                    },
+                    files={"source": (Path(image_path).name, f, "image/png")},
+                    timeout=60,
+                )
+            if r.status_code not in (200, 201):
+                raise RuntimeError(f"Facebook Graph API photo post failed: HTTP {r.status_code} | {r.text[:500]}")
+            logger.info("✅ Posted image + text to Facebook Page via Graph API.")
+            return r.json()
+
         url = f"https://graph.facebook.com/{version}/{page_id}/feed"
         r = requests.post(
             url,
@@ -1434,7 +1520,45 @@ class PlaywrightSocialService:
         except Exception:
             return False
 
-    async def post_x(self, text: str):
+    async def _attach_image_if_possible(self, page, image_path: str | None, *, platform: str) -> bool:
+        image_path = self._valid_image_path(image_path)
+        if not image_path:
+            return False
+
+        selectors = [
+            'input[data-testid="fileInput"]',
+            'input[type="file"][accept*="image"]',
+            'input[type="file"]',
+        ]
+
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0:
+                    await loc.set_input_files(image_path)
+                    await page.wait_for_timeout(5000)
+                    logger.info(f"🖼️ Attached generated image to {platform} post.")
+                    return True
+            except Exception:
+                pass
+
+        try:
+            count = await page.locator('input[type="file"]').count()
+            for idx in range(count):
+                try:
+                    await page.locator('input[type="file"]').nth(idx).set_input_files(image_path)
+                    await page.wait_for_timeout(5000)
+                    logger.info(f"🖼️ Attached generated image to {platform} post.")
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        logger.warning(f"Could not attach generated image to {platform}; posting text only.")
+        return False
+
+    async def post_x(self, text: str, image_path: str | None = None):
         cfg = self.cfg_getter()
         if not cfg.enable_x_post:
             logger.info("X posting is disabled, skipping X.")
@@ -1442,6 +1566,8 @@ class PlaywrightSocialService:
 
         x_api_access_token = self._env_or_cfg(cfg, "x_api_access_token", "X_API_ACCESS_TOKEN")
         if x_api_access_token:
+            if self._valid_image_path(image_path):
+                logger.info("X API token is configured; posting text only because media upload is not enabled in this lightweight API path.")
             await asyncio.to_thread(self.post_x_api, text, x_api_access_token)
             return
 
@@ -1487,13 +1613,12 @@ class PlaywrightSocialService:
                 if not box:
                     raise RuntimeError("Could not find the X composer input. Log in again or check whether the X interface changed.")
 
-                short_text = text
-                if len(short_text) > 260:
-                    short_text = short_text[:255] + "..."
+                short_text = self._x_post_text(text)
 
                 await box.click()
                 await page.keyboard.insert_text(short_text)
                 await page.wait_for_timeout(1000)
+                await self._attach_image_if_possible(page, image_path, platform="X")
 
                 buttons = [
                     'button[data-testid="tweetButton"]',
@@ -1511,7 +1636,7 @@ class PlaywrightSocialService:
             finally:
                 await context.close()
 
-    async def post_facebook(self, text: str):
+    async def post_facebook(self, text: str, image_path: str | None = None, image_url: str | None = None):
         cfg = self.cfg_getter()
         if not cfg.enable_facebook_post:
             logger.info("Facebook posting is disabled, skipping Facebook.")
@@ -1520,7 +1645,7 @@ class PlaywrightSocialService:
         page_id = self._env_or_cfg(cfg, "facebook_page_id", "FACEBOOK_PAGE_ID")
         page_access_token = self._env_or_cfg(cfg, "facebook_page_access_token", "FACEBOOK_PAGE_ACCESS_TOKEN")
         if page_id and page_access_token:
-            await asyncio.to_thread(self.post_facebook_graph_api, text, page_id, page_access_token)
+            await asyncio.to_thread(self.post_facebook_graph_api, text, page_id, page_access_token, image_path)
             return
 
         target = cfg.facebook_target_url.strip() or "https://www.facebook.com/"
@@ -1598,10 +1723,13 @@ class PlaywrightSocialService:
                 await box.click()
                 await page.keyboard.insert_text(text)
                 await page.wait_for_timeout(1000)
+                await self._attach_image_if_possible(page, image_path, platform="Facebook")
 
                 post_buttons = [
-                    'div[aria-label="Post"]',
-                    'div[aria-label="Đăng"]',
+                    'div[aria-label="Post"][role="button"]',
+                    'div[aria-label="Đăng"][role="button"]',
+                    'div[aria-label*="Post"][role="button"]',
+                    'div[aria-label*="Đăng"][role="button"]',
                     'div[role="button"]:has-text("Post")',
                     'div[role="button"]:has-text("Đăng")',
                     'span:has-text("Post")',
@@ -1699,24 +1827,63 @@ class TelegramService:
         logger.info(f"✅ Telegram session OK: {getattr(me, 'username', None) or me.id}")
         await client.disconnect()
 
-    def send_telegram_bot_api(self, text: str, bot_token: str, chat_ids: List[str]):
+    def _valid_image_path(self, image_path: str | None) -> str:
+        if not image_path:
+            return ""
+        try:
+            path = Path(str(image_path))
+            if path.exists() and path.is_file() and path.stat().st_size > 0:
+                return str(path)
+        except Exception:
+            pass
+        return ""
+
+    def _telegram_caption(self, text: str) -> str:
+        text = (text or "").strip()
+        if len(text) <= 1024:
+            return text
+        urls = re.findall(r"https?://\S+", text)
+        url = urls[-1].rstrip(".,)") if urls else ""
+        body = re.sub(r"https?://\S+", "", text).strip()
+        if url:
+            limit = max(80, 1024 - len(url) - 2)
+            short = body[: max(0, limit - 1)].rstrip()
+            if " " in short:
+                short = short.rsplit(" ", 1)[0].rstrip()
+            return f"{short}…\n{url}"[:1024].rstrip()
+        return text[:1023].rstrip() + "…"
+
+    def send_telegram_bot_api(self, text: str, bot_token: str, chat_ids: List[str], image_path: str | None = None):
         if not bot_token or not chat_ids:
             return
+        image_path = self._valid_image_path(image_path)
         for i, chat_id in enumerate(chat_ids, start=1):
-            r = requests.post(
-                f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": (text or "")[:4096],
-                    "disable_web_page_preview": False,
-                },
-                timeout=30,
-            )
+            if image_path:
+                with open(image_path, "rb") as f:
+                    r = requests.post(
+                        f"https://api.telegram.org/bot{bot_token}/sendPhoto",
+                        data={
+                            "chat_id": chat_id,
+                            "caption": self._telegram_caption(text),
+                        },
+                        files={"photo": (Path(image_path).name, f, "image/png")},
+                        timeout=60,
+                    )
+            else:
+                r = requests.post(
+                    f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                    json={
+                        "chat_id": chat_id,
+                        "text": (text or "")[:4096],
+                        "disable_web_page_preview": False,
+                    },
+                    timeout=30,
+                )
             if r.status_code not in (200, 201):
                 raise RuntimeError(f"Telegram Bot API send failed for {chat_id}: HTTP {r.status_code} | {r.text[:500]}")
             logger.info(f"✅ Telegram Bot API social [{i}/{len(chat_ids)}] {chat_id}")
 
-    async def send_social_post(self, text: str):
+    async def send_social_post(self, text: str, image_path: str | None = None):
         cfg = self.cfg_getter()
         if not cfg.enable_telegram_social_post:
             return
@@ -1724,7 +1891,7 @@ class TelegramService:
         bot_token = (getattr(cfg, "telegram_bot_token", "") or os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
         bot_chat_ids = parse_lines(getattr(cfg, "telegram_bot_chat_ids", "") or os.getenv("TELEGRAM_BOT_CHAT_IDS", ""))
         if bot_token and bot_chat_ids:
-            await asyncio.to_thread(self.send_telegram_bot_api, text, bot_token, bot_chat_ids)
+            await asyncio.to_thread(self.send_telegram_bot_api, text, bot_token, bot_chat_ids, image_path)
             return
 
         targets = []
@@ -1753,7 +1920,11 @@ class TelegramService:
         for i, target in enumerate(targets, start=1):
             try:
                 logger.info(f"📨 Telegram social [{i}/{len(targets)}] {target}")
-                await client.send_message(target, text)
+                valid_image = self._valid_image_path(image_path)
+                if valid_image:
+                    await client.send_file(target, valid_image, caption=self._telegram_caption(text))
+                else:
+                    await client.send_message(target, text)
                 await asyncio.sleep(2)
             except FloodWaitError as e:
                 logger.warning(f"FloodWait {e.seconds}s")
@@ -1799,9 +1970,18 @@ class TelegramService:
                 messages = await client.get_messages(source, limit=20)
                 handled_groups = set()
 
+                # Telegram channels can contain service/empty messages, for example
+                # channel-created notices, pinned-message notices, or unsupported
+                # objects. These messages have no text and no downloadable media.
+                # Sending them to another chat causes Telegram to return:
+                # "The message cannot be empty unless a file is provided".
+                # Mark them as handled so the forward loop does not retry forever.
                 for msg in messages:
                     if stop_event.is_set():
                         break
+
+                    if not msg or not getattr(msg, "id", None):
+                        continue
 
                     if db.is_sent_message(msg.id):
                         continue
@@ -1809,9 +1989,10 @@ class TelegramService:
                     logger.info(f"🆕 Forward msg ID {msg.id}")
 
                     media_files = []
-                    caption = msg.text or ""
+                    caption = (getattr(msg, "text", None) or getattr(msg, "message", None) or "").strip()
+                    album_message_ids = []
 
-                    if msg.grouped_id:
+                    if getattr(msg, "grouped_id", None):
                         if msg.grouped_id in handled_groups:
                             continue
 
@@ -1821,25 +2002,44 @@ class TelegramService:
                             max_id=msg.id + 10
                         )
 
-                        album_msgs = [m for m in album if m.grouped_id == msg.grouped_id]
+                        album_msgs = [m for m in album if getattr(m, "grouped_id", None) == msg.grouped_id]
+                        # Keep album files in Telegram order instead of newest-first.
+                        album_msgs = sorted(album_msgs, key=lambda m: m.id)
+                        album_message_ids = [m.id for m in album_msgs if getattr(m, "id", None)]
                         handled_groups.add(msg.grouped_id)
 
                         caption = ""
                         for m in album_msgs:
-                            if m.media:
-                                file = await m.download_media(file=str(RUNTIME_DIR))
-                                media_files.append(file)
-                            if m.text and not caption:
-                                caption = m.text
+                            if getattr(m, "media", None):
+                                try:
+                                    file = await m.download_media(file=str(RUNTIME_DIR))
+                                    if file and os.path.exists(file):
+                                        media_files.append(file)
+                                except Exception as e:
+                                    logger.warning(f"Could not download album media msg={m.id}: {e}")
+                            m_text = (getattr(m, "text", None) or getattr(m, "message", None) or "").strip()
+                            if m_text and not caption:
+                                caption = m_text
 
                     else:
-                        if msg.media:
-                            file = await msg.download_media(file=str(RUNTIME_DIR))
-                            media_files.append(file)
+                        if getattr(msg, "media", None):
+                            try:
+                                file = await msg.download_media(file=str(RUNTIME_DIR))
+                                if file and os.path.exists(file):
+                                    media_files.append(file)
+                            except Exception as e:
+                                logger.warning(f"Could not download media msg={msg.id}: {e}")
+
+                    final_text = (caption or "").strip()
+                    if not media_files and not final_text:
+                        logger.info(f"⏭️ Skip empty/unsupported Telegram message ID {msg.id}")
+                        db.mark_sent_message(msg.id)
+                        for mid in album_message_ids:
+                            db.mark_sent_message(mid)
+                        continue
 
                     for target in targets:
                         try:
-                            final_text = caption or ""
                             if media_files:
                                 await client.send_file(target, media_files, caption=final_text)
                             else:
@@ -1863,6 +2063,8 @@ class TelegramService:
                             pass
 
                     db.mark_sent_message(msg.id)
+                    for mid in album_message_ids:
+                        db.mark_sent_message(mid)
 
                 await asyncio.sleep(60)
 

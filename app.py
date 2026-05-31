@@ -810,14 +810,14 @@ def save_from_form(data: Dict[str, Any]) -> None:
 # SERVICES
 # =========================================================
 
-async def publish_socials(summary: str):
+async def publish_socials(summary: str, image_path: str = "", image_url: str = ""):
     tasks = []
     if cfg.enable_telegram_social_post:
-        tasks.append(telegram_service.send_social_post(summary))
+        tasks.append(telegram_service.send_social_post(summary, image_path))
     if cfg.enable_x_post:
-        tasks.append(social_service.post_x(summary))
+        tasks.append(social_service.post_x(summary, image_path))
     if cfg.enable_facebook_post:
-        tasks.append(social_service.post_facebook(summary))
+        tasks.append(social_service.post_facebook(summary, image_path, image_url))
 
     for task in tasks:
         try:
@@ -846,7 +846,7 @@ def bot_worker():
             if now >= next_wp_time:
                 result = news_service.create_and_post_once()
                 if result:
-                    fut = runtime.submit(publish_socials(result["summary"]))
+                    fut = runtime.submit(publish_socials(result["summary"], result.get("image_path", ""), result.get("image_url", "")))
                     try:
                         fut.result(timeout=300)
                     except Exception as e:
@@ -860,15 +860,15 @@ def bot_worker():
     logger.info("Bot stopped.")
 
 
-async def publish_socials_for_state(summary: str, state: dict[str, Any]):
+async def publish_socials_for_state(summary: str, state: dict[str, Any], image_path: str = "", image_url: str = ""):
     c = state["holder"]["cfg"]
     tasks = []
     if c.enable_telegram_social_post:
-        tasks.append(state["telegram"].send_social_post(summary))
+        tasks.append(state["telegram"].send_social_post(summary, image_path))
     if c.enable_x_post:
-        tasks.append(state["social"].post_x(summary))
+        tasks.append(state["social"].post_x(summary, image_path))
     if c.enable_facebook_post:
-        tasks.append(state["social"].post_facebook(summary))
+        tasks.append(state["social"].post_facebook(summary, image_path, image_url))
     for task in tasks:
         try:
             await task
@@ -893,7 +893,7 @@ def bot_worker_for_user(address: str, stop_evt: threading.Event):
             if now >= next_wp_time:
                 result = state["news"].create_and_post_once()
                 if result:
-                    fut = runtime.submit(await_with_user_log_context(a, publish_socials_for_state(result["summary"], state)))
+                    fut = runtime.submit(await_with_user_log_context(a, publish_socials_for_state(result["summary"], state, result.get("image_path", ""), result.get("image_url", ""))))
                     try:
                         fut.result(timeout=300)
                     except Exception as e:
@@ -2497,14 +2497,29 @@ def start(request: Request):
     if guard: return guard
     address = normalize_address(user["address"])
     state = user_bots.get(address)
-    if state and state.get("thread") and state["thread"].is_alive():
-        log_info_for_user(address, f"Bot is already running for {short_addr(address)}.")
-    else:
-        stop_evt = threading.Event()
-        thread = threading.Thread(target=bot_worker_for_user, args=(address, stop_evt), daemon=True)
-        user_bots[address] = {"thread": thread, "stop_event": stop_evt}
-        thread.start()
-        log_info_for_user(address, f"🚀 Bot started for {short_addr(address)}.")
+
+    if state:
+        thread = state.get("thread")
+        stop_evt = state.get("stop_event")
+        is_running = bool(thread and thread.is_alive() and stop_evt and not stop_evt.is_set())
+        if is_running:
+            log_info_for_user(address, f"Bot is already running for {short_addr(address)}.")
+            return RedirectResponse("/?tab=home", status_code=303)
+
+        # Stale state: user pressed Stop, status is Stopped, but the old daemon
+        # thread is still cleaning up. Do not block a fresh Start.
+        if thread and thread.is_alive() and stop_evt and stop_evt.is_set():
+            try:
+                thread.join(timeout=2)
+            except Exception:
+                pass
+        user_bots.pop(address, None)
+
+    stop_evt = threading.Event()
+    thread = threading.Thread(target=bot_worker_for_user, args=(address, stop_evt), daemon=True)
+    user_bots[address] = {"thread": thread, "stop_event": stop_evt}
+    thread.start()
+    log_info_for_user(address, f"🚀 Bot started for {short_addr(address)}.")
     return RedirectResponse("/?tab=home", status_code=303)
 
 
@@ -2516,6 +2531,14 @@ def stop(request: Request):
     state = user_bots.get(address)
     if state:
         state["stop_event"].set()
+        thread = state.get("thread")
+        if thread:
+            try:
+                thread.join(timeout=2)
+            except Exception:
+                pass
+            if not thread.is_alive():
+                user_bots.pop(address, None)
     log_info_for_user(address, f"🛑 Stopping bot for {short_addr(address)}...")
     return RedirectResponse("/?tab=home", status_code=303)
 
@@ -2553,7 +2576,7 @@ def post_once(request: Request):
         try:
             result = state["news"].create_and_post_once()
             if result:
-                fut = runtime.submit(await_with_user_log_context(address, publish_socials_for_state(result["summary"], state)))
+                fut = runtime.submit(await_with_user_log_context(address, publish_socials_for_state(result["summary"], state, result.get("image_path", ""), result.get("image_url", ""))))
                 fut.result(timeout=300)
         except Exception as e:
             logger.error(f"Post once error: {e}")
