@@ -573,3 +573,24 @@ Check:
 ### Social posting fails
 
 Cookies may have expired or the platform UI may have changed. Re-export cookies and use the test buttons.
+
+## Simple ERC-8004 / Verified BlockScam Proof Mode
+
+Project owners can set the default ERC-8004 / BlockScam proof infrastructure in Railway Variables so users do not need to configure Agent Registry, Validation Registry, Validator Address, or Agent ID manually.
+
+Recommended Railway variables:
+
+```env
+ERC8004_RPC_URL=https://rpc.mantle.xyz
+ERC8004_AGENT_REGISTRY=0x8004A169FB4a3325136EB29fA0ceB6D2e539a432
+ERC8004_REPUTATION_REGISTRY=0x8004BAa17C55a88189AE136b182e5fdA19dE9b63
+ERC8004_VALIDATION_REGISTRY=0xYourValidationRegistry
+ERC8004_VALIDATOR_ADDRESS=0xYourValidatorAddress
+ERC8004_AGENT_ID=1
+ERC8004_EVIDENCE_BASE_URL=https://your-app.up.railway.app
+ERC8004_ONCHAIN_MIN_SCORE=90
+```
+
+Leave `ERC8004_PRIVATE_KEY` empty in Railway for public deployments. Each user can save their own fresh low-balance Proof Writer private key in the dashboard.
+
+Do not set `ENABLE_ERC8004_PROOF=0` if you want users to control the toggle in their workspace. Leaving it empty lets the per-wallet dashboard setting decide whether on-chain proof is enabled.

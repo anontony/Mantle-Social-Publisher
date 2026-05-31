@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "compile": "hardhat compile",
-    "deploy:mantle": "hardhat run scripts/deploy.js --network mantle"
+    "deploy:mantle": "hardhat run scripts/deploy.js --network mantle",
+    "deploy:validation": "hardhat run scripts/deploy_validation.js --network mantle"
   },
   "devDependencies": {
     "@nomicfoundation/hardhat-toolbox": "^5.0.0",

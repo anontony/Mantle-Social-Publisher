@@ -2,8 +2,9 @@
 pragma solidity ^0.8.24;
 
 /// @title BlockScamValidationRegistry
-/// @notice ERC-8004-compatible validation registry for BlockScam moderation proofs.
-/// @dev This is a lightweight demo registry. It stores validation requests and optional validator responses.
+/// @notice Lightweight ERC-8004-compatible validation registry for BlockScam moderation proofs.
+/// @dev Stores validation requests and optional validator responses. It is designed for demos
+///      and hackathon deployments where a project wants a simple validationRequest endpoint.
 contract BlockScamValidationRegistry {
     struct ValidationData {
         address requester;
@@ -13,9 +14,8 @@ contract BlockScamValidationRegistry {
         bytes32 requestHash;
         uint64 createdAt;
         bool exists;
-
         bool responded;
-        uint8 response; // 0-100
+        uint8 response;
         string responseURI;
         bytes32 responseHash;
         string tag;
@@ -74,13 +74,7 @@ contract BlockScamValidationRegistry {
         validationsByAgent[agentId].push(requestHash);
         requestsByValidator[validatorAddress].push(requestHash);
 
-        emit ValidationRequested(
-            msg.sender,
-            validatorAddress,
-            agentId,
-            requestURI,
-            requestHash
-        );
+        emit ValidationRequested(msg.sender, validatorAddress, agentId, requestURI, requestHash);
     }
 
     function validationResponse(
@@ -91,7 +85,6 @@ contract BlockScamValidationRegistry {
         string calldata tag
     ) external {
         ValidationData storage data = validations[requestHash];
-
         require(data.exists, "request not found");
         require(msg.sender == data.validator, "only validator");
         require(!data.responded, "already responded");
@@ -104,15 +97,7 @@ contract BlockScamValidationRegistry {
         data.tag = tag;
         data.respondedAt = uint64(block.timestamp);
 
-        emit ValidationResponded(
-            msg.sender,
-            data.agentId,
-            requestHash,
-            response,
-            responseURI,
-            responseHash,
-            tag
-        );
+        emit ValidationResponded(msg.sender, data.agentId, requestHash, response, responseURI, responseHash, tag);
     }
 
     function getValidationStatus(bytes32 requestHash)
@@ -132,7 +117,6 @@ contract BlockScamValidationRegistry {
         )
     {
         ValidationData storage data = validations[requestHash];
-
         return (
             data.exists,
             data.responded,
@@ -147,50 +131,31 @@ contract BlockScamValidationRegistry {
         );
     }
 
-    function getAgentValidations(uint256 agentId)
-        external
-        view
-        returns (bytes32[] memory)
-    {
+    function getAgentValidations(uint256 agentId) external view returns (bytes32[] memory) {
         return validationsByAgent[agentId];
     }
 
-    function getValidatorRequests(address validator)
-        external
-        view
-        returns (bytes32[] memory)
-    {
+    function getValidatorRequests(address validator) external view returns (bytes32[] memory) {
         return requestsByValidator[validator];
     }
 
     function getSummary(uint256 agentId)
         external
         view
-        returns (
-            uint256 total,
-            uint256 completed,
-            uint256 averageResponse
-        )
+        returns (uint256 total, uint256 completed, uint256 averageResponse)
     {
         bytes32[] storage list = validationsByAgent[agentId];
-
         total = list.length;
-
-        if (total == 0) {
-            return (0, 0, 0);
-        }
+        if (total == 0) return (0, 0, 0);
 
         uint256 sum = 0;
-
         for (uint256 i = 0; i < list.length; i++) {
             ValidationData storage data = validations[list[i]];
-
             if (data.responded) {
                 completed++;
                 sum += data.response;
             }
         }
-
         averageResponse = completed == 0 ? 0 : sum / completed;
     }
 }

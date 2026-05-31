@@ -299,19 +299,36 @@ def apply_server_subscription_settings(cfg: AppConfig) -> AppConfig:
     cfg.credit_token_address = os.getenv("CREDIT_TOKEN_ADDRESS", cfg.credit_token_address).strip()
     cfg.credit_token_symbol = os.getenv("CREDIT_TOKEN_SYMBOL", cfg.credit_token_symbol or CREDIT_TOKEN_SYMBOL).strip() or CREDIT_TOKEN_SYMBOL
 
-    # ERC-8004 defaults can be injected from Railway Variables. User/workspace values
-    # are preserved unless an environment variable is explicitly provided.
-    cfg.erc8004_rpc_url = os.getenv("ERC8004_RPC_URL", cfg.erc8004_rpc_url or cfg.mantle_rpc_url).strip() or cfg.mantle_rpc_url
-    cfg.erc8004_agent_registry = os.getenv("ERC8004_AGENT_REGISTRY", cfg.erc8004_agent_registry).strip()
-    cfg.erc8004_reputation_registry = os.getenv("ERC8004_REPUTATION_REGISTRY", cfg.erc8004_reputation_registry).strip()
-    cfg.erc8004_validation_registry = os.getenv("ERC8004_VALIDATION_REGISTRY", cfg.erc8004_validation_registry).strip()
-    cfg.erc8004_validator_address = os.getenv("ERC8004_VALIDATOR_ADDRESS", cfg.erc8004_validator_address).strip()
-    cfg.erc8004_agent_id = os.getenv("ERC8004_AGENT_ID", cfg.erc8004_agent_id).strip()
-    cfg.erc8004_evidence_base_url = os.getenv("ERC8004_EVIDENCE_BASE_URL", cfg.erc8004_evidence_base_url).strip()
-    cfg.erc8004_private_key = os.getenv("ERC8004_PRIVATE_KEY", cfg.erc8004_private_key).strip()
-    cfg.enable_erc8004_proof = str(os.getenv("ENABLE_ERC8004_PROOF", str(cfg.enable_erc8004_proof))).strip().lower() in {"1", "true", "yes", "on"}
+    # ERC-8004 defaults can be injected from Railway Variables.
+    # Important: empty env values do NOT erase per-wallet user settings.
+    # This lets the project owner set the default BlockScam Agent/Validation Registry once,
+    # while each user only saves their own Proof Writer private key in their workspace.
+    def _env_non_empty(name: str, current: str) -> str:
+        value = os.getenv(name)
+        if value is None:
+            return current
+        value = value.strip()
+        return value if value else current
+
+    cfg.erc8004_rpc_url = _env_non_empty("ERC8004_RPC_URL", cfg.erc8004_rpc_url or cfg.mantle_rpc_url) or cfg.mantle_rpc_url
+    cfg.erc8004_agent_registry = _env_non_empty("ERC8004_AGENT_REGISTRY", cfg.erc8004_agent_registry)
+    cfg.erc8004_reputation_registry = _env_non_empty("ERC8004_REPUTATION_REGISTRY", cfg.erc8004_reputation_registry)
+    cfg.erc8004_validation_registry = _env_non_empty("ERC8004_VALIDATION_REGISTRY", cfg.erc8004_validation_registry)
+    cfg.erc8004_validator_address = _env_non_empty("ERC8004_VALIDATOR_ADDRESS", cfg.erc8004_validator_address)
+    cfg.erc8004_agent_id = _env_non_empty("ERC8004_AGENT_ID", cfg.erc8004_agent_id)
+    cfg.erc8004_evidence_base_url = _env_non_empty("ERC8004_EVIDENCE_BASE_URL", cfg.erc8004_evidence_base_url)
+
+    # Private key override is optional. In public deployments, prefer NOT setting this
+    # globally; let each user save a fresh low-balance Proof Writer wallet instead.
+    cfg.erc8004_private_key = _env_non_empty("ERC8004_PRIVATE_KEY", cfg.erc8004_private_key)
+
+    enable_env = os.getenv("ENABLE_ERC8004_PROOF")
+    if enable_env is not None and enable_env.strip() != "":
+        cfg.enable_erc8004_proof = enable_env.strip().lower() in {"1", "true", "yes", "on"}
+
+    min_score_env = os.getenv("ERC8004_ONCHAIN_MIN_SCORE")
     try:
-        cfg.erc8004_onchain_min_score = int(os.getenv("ERC8004_ONCHAIN_MIN_SCORE", str(cfg.erc8004_onchain_min_score)).strip())
+        cfg.erc8004_onchain_min_score = int((min_score_env if min_score_env is not None and min_score_env.strip() else str(cfg.erc8004_onchain_min_score)).strip())
     except Exception:
         cfg.erc8004_onchain_min_score = 90
     try:

@@ -2213,6 +2213,32 @@ def forward_content() -> str:
 
 
 def blockscam_content() -> str:
+    def short_value(value: Any) -> str:
+        value = str(value or "").strip()
+        if not value:
+            return "Missing"
+        if value.startswith("http"):
+            return value
+        if len(value) > 18:
+            return f"{value[:8]}...{value[-6:]}"
+        return value
+
+    has_project_agent = bool(
+        getattr(cfg, "erc8004_agent_id", "")
+        and getattr(cfg, "erc8004_validation_registry", "")
+        and getattr(cfg, "erc8004_validator_address", "")
+        and getattr(cfg, "erc8004_evidence_base_url", "")
+    )
+    proof_key_ready = bool(getattr(cfg, "erc8004_private_key", ""))
+    onchain_ready = has_project_agent and proof_key_ready and bool(getattr(cfg, "enable_erc8004_proof", False))
+    readiness = "Ready" if onchain_ready else ("Need Proof Writer Key" if has_project_agent else "Project Agent Not Configured")
+    readiness_class = "ok" if onchain_ready else ("warn" if has_project_agent else "bad")
+    readiness_help = (
+        "The project default BlockScam Agent is configured. Users only need a fresh Proof Writer wallet with small MNT for gas."
+        if has_project_agent
+        else "Ask the project owner to set Agent ID, Validation Registry, Validator Address, and Evidence Base URL in Railway Variables."
+    )
+
     return f"""
 <form method="post" action="/save?next=blockscam">
 <input type="hidden" name="bool__enable_block_scam" value="1">
@@ -2220,7 +2246,7 @@ def blockscam_content() -> str:
 <input type="hidden" name="bool__enable_erc8004_proof" value="1">
 <div class="card">
   <h3>AI BlockScam Monitor</h3>
-  <p class="help">BlockScam uses fast keyword rules first, then optional AI classification. When a scam action is taken, the bot creates a moderation proof hash and can submit it to an ERC-8004 Validation Registry.</p>
+  <p class="help">BlockScam monitors the Telegram groups/channels you enter below. If it detects scam messages, it can delete the message, block/kick the sender when your Telegram account has admin permission, and create a moderation proof.</p>
   <div class="checkrow">
     <label><input type="checkbox" name="enable_block_scam" {checked('enable_block_scam')}> Enable BlockScam</label>
     <label><input type="checkbox" name="enable_block_scam_ai" {checked('enable_block_scam_ai')}> Enable AI Scam Detection</label>
@@ -2233,33 +2259,50 @@ def blockscam_content() -> str:
     </select>
     <label>AI Delete Threshold</label><input name="block_scam_ai_threshold" value="{esc(getattr(cfg, 'block_scam_ai_threshold', 7))}" placeholder="7">
   </div>
-  <label>Chats to Scan, one group/channel per line</label><textarea name="block_scam_target_chats">{esc(cfg.block_scam_target_chats)}</textarea>
+  <label>Chats to Scan, one group/channel per line</label>
+  <textarea name="block_scam_target_chats" placeholder="@your_group\n-1001234567890\nhttps://t.me/your_group">{esc(cfg.block_scam_target_chats)}</textarea>
+  <p class="help">BlockScam will not monitor anything until at least one Telegram group/channel is saved here. The logged-in Telegram account must be an admin with permission to delete messages and ban/restrict users.</p>
   <label>Scam Keywords, one keyword per line</label><textarea name="block_scam_keywords">{esc(cfg.block_scam_keywords)}</textarea>
 </div>
 
 <div class="card">
-  <h3>ERC-8004 Proof Settings</h3>
-  <p class="help">For every high-risk moderation action, BlockScam stores a local evidence report and proof hash. If these fields are configured, it also sends validationRequest(validatorAddress, agentId, requestURI, proofHash) on Mantle.</p>
-  <div class="checkrow">
-    <label><input type="checkbox" name="enable_erc8004_proof" {checked('enable_erc8004_proof')}> Enable ERC-8004 On-chain Proof</label>
+  <h3>Verified On-chain Proof</h3>
+  <p class="help">Use the project default BlockScam Agent. Users do not need to deploy ERC-8004 contracts or understand registries. They only need a fresh Proof Writer wallet funded with a small amount of MNT for gas.</p>
+  <div class="profile-grid">
+    <div class="metric"><span>Status</span><b class="{readiness_class}">{esc(readiness)}</b></div>
+    <div class="metric"><span>Agent ID</span><b>{esc(getattr(cfg, 'erc8004_agent_id', '') or 'Missing')}</b></div>
+    <div class="metric"><span>Validation Registry</span><b>{esc(short_value(getattr(cfg, 'erc8004_validation_registry', '')))}</b></div>
+    <div class="metric"><span>Validator</span><b>{esc(short_value(getattr(cfg, 'erc8004_validator_address', '')))}</b></div>
   </div>
+  <p class="help">{esc(readiness_help)}</p>
+  <div class="checkrow">
+    <label><input type="checkbox" name="enable_erc8004_proof" {checked('enable_erc8004_proof')}> Enable Verified On-chain Proof</label>
+  </div>
+  <div class="grid">
+    <label>Proof Writer Private Key</label>{secret_input('erc8004_private_key', getattr(cfg, 'erc8004_private_key', ''), '0x... fresh gas wallet only')}
+    <label>On-chain Min Score</label><input name="erc8004_onchain_min_score" value="{esc(getattr(cfg, 'erc8004_onchain_min_score', 90))}" placeholder="90">
+  </div>
+  <p class="help"><b>Security warning:</b> Never use your main wallet. Create a new wallet only for proof gas, fund it with a small amount of MNT, and paste that private key here.</p>
+  <div class="actions">
+    <button class="primary" type="submit">Save BlockScam + Proof</button>
+    <button formaction="/blockscam/test-proof" formmethod="post" type="submit">Test Proof</button>
+    <a class="button" href="/blockscam/proofs" target="_blank">View Proofs</a>
+  </div>
+</div>
+
+<details class="card">
+  <summary style="cursor:pointer;font-weight:900;font-size:18px">Advanced ERC-8004 Settings</summary>
+  <p class="help">Most users should not edit this. Project owners can set these once in Railway Variables. Advanced builders can override them per wallet if they run their own agent/registry.</p>
   <div class="grid">
     <label>Mantle / ERC-8004 RPC URL</label><input name="erc8004_rpc_url" value="{esc(getattr(cfg, 'erc8004_rpc_url', ''))}" placeholder="https://rpc.mantle.xyz">
     <label>Agent Registry</label><input name="erc8004_agent_registry" value="{esc(getattr(cfg, 'erc8004_agent_registry', ''))}">
     <label>Reputation Registry</label><input name="erc8004_reputation_registry" value="{esc(getattr(cfg, 'erc8004_reputation_registry', ''))}">
-    <label>Validation Registry</label><input name="erc8004_validation_registry" value="{esc(getattr(cfg, 'erc8004_validation_registry', ''))}" placeholder="0x... provided by your validator or ERC-8004 deployment">
+    <label>Validation Registry</label><input name="erc8004_validation_registry" value="{esc(getattr(cfg, 'erc8004_validation_registry', ''))}" placeholder="0x...">
     <label>Validator Address</label><input name="erc8004_validator_address" value="{esc(getattr(cfg, 'erc8004_validator_address', ''))}" placeholder="0x...">
-    <label>BlockScam Agent ID</label><input name="erc8004_agent_id" value="{esc(getattr(cfg, 'erc8004_agent_id', ''))}" placeholder="Example: 12">
-    <label>Evidence Base URL</label><input name="erc8004_evidence_base_url" value="{esc(getattr(cfg, 'erc8004_evidence_base_url', ''))}" placeholder="https://your-railway-domain.up.railway.app">
-    <label>Proof writer private key</label>{secret_input('erc8004_private_key', getattr(cfg, 'erc8004_private_key', ''))}
-    <label>On-chain Min Score</label><input name="erc8004_onchain_min_score" value="{esc(getattr(cfg, 'erc8004_onchain_min_score', 90))}" placeholder="90">
+    <label>BlockScam Agent ID</label><input name="erc8004_agent_id" value="{esc(getattr(cfg, 'erc8004_agent_id', ''))}" placeholder="Example: 1">
+    <label>Evidence Base URL</label><input name="erc8004_evidence_base_url" value="{esc(getattr(cfg, 'erc8004_evidence_base_url', ''))}" placeholder="https://your-app.up.railway.app">
   </div>
-  <div class="actions">
-    <button class="primary">Save BlockScam + ERC-8004</button>
-    <a class="button" href="/blockscam/proofs" target="_blank">View Proofs</a>
-  </div>
-  <p class="help">Local proof always works. On-chain proof requires web3 in requirements.txt, a funded Mantle wallet, a registered Agent ID, Validation Registry, and Validator Address.</p>
-</div>
+</details>
 </form>
 """
 
@@ -2422,6 +2465,7 @@ def home(request: Request, tab: str = "home", msg: str = ""):
         "logout": "Wallet disconnected.",
         "subrequired": "Monthly subscription required before using this feature.",
         "loginrequired": "Connect your wallet before saving workspace settings.",
+        "prooftest": "Test proof started. Check the workspace logs and View Proofs for the result.",
     }
     message = message_map.get(msg, "")
     if tab == "profile":
@@ -2617,6 +2661,55 @@ def logs(request: Request):
         text = "\n".join(logs_for_user(user, MAX_LOGS))
     return PlainTextResponse(text, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"})
 
+
+
+@app.post("/blockscam/test-proof")
+async def blockscam_test_proof(request: Request):
+    user, guard = require_active_user(request, tab="blockscam")
+    if guard:
+        return guard
+
+    address = normalize_address(user["address"])
+    activate_config_for_user(user)
+
+    # The Test Proof button submits the same form, so save the latest BlockScam/ERC-8004 settings first.
+    form = await request.form()
+    save_from_form(dict(form))
+    apply_server_subscription_settings(cfg)
+    save_config_for_user(address, cfg)
+
+    state = get_user_services(address)
+
+    def worker():
+        token = set_log_context(address)
+        try:
+            current_cfg = state["holder"]["cfg"]
+            proof_service = state["block"].proof_service
+            report, report_json, proof_hash = proof_service.build_report(
+                chat="blockscam-manual-test",
+                message_id=int(time.time()),
+                sender_id="manual-test-user",
+                text="Manual ERC-8004 BlockScam proof test. This is not a real Telegram moderation action.",
+                action="manual_test_proof",
+                risk_score=100,
+                risk_reason="manual_test",
+                matched_rules=["MANUAL_TEST"],
+                bot_version="blockscam-telegram-v2-test",
+            )
+
+            tx_hash = ""
+            if getattr(current_cfg, "enable_erc8004_proof", False):
+                tx_hash = proof_service.submit_validation_request_if_ready(proof_hash)
+
+            proof_service.save_local_proof(report, report_json, proof_hash, tx_hash)
+            logger.info(f"🧾 Test BlockScam proof created | hash={proof_hash} | tx={tx_hash or 'local-only'}")
+        except Exception as e:
+            logger.error(f"Test ERC-8004 proof error: {e}")
+        finally:
+            clear_log_context(token)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return RedirectResponse("/?tab=blockscam&msg=prooftest", status_code=303)
 
 
 @app.get("/blockscam/proofs", response_class=HTMLResponse)

@@ -573,3 +573,46 @@ Check:
 ### Social posting fails
 
 Cookies may have expired or the platform UI may have changed. Re-export cookies and use the test buttons.
+
+## Simple ERC-8004 / Verified BlockScam Proof Mode
+
+This build supports a simpler ERC-8004 user experience.
+
+The project owner can deploy and configure the default BlockScam proof infrastructure once:
+
+```env
+ERC8004_AGENT_REGISTRY=0x8004A169FB4a3325136EB29fA0ceB6D2e539a432
+ERC8004_REPUTATION_REGISTRY=0x8004BAa17C55a88189AE136b182e5fdA19dE9b63
+ERC8004_VALIDATION_REGISTRY=0xYourValidationRegistry
+ERC8004_VALIDATOR_ADDRESS=0xYourValidatorAddress
+ERC8004_AGENT_ID=1
+ERC8004_EVIDENCE_BASE_URL=https://your-app.up.railway.app
+ERC8004_ONCHAIN_MIN_SCORE=90
+```
+
+Normal users do not need to understand or deploy ERC-8004 contracts. They only need to:
+
+1. Create a fresh wallet used only as a Proof Writer wallet.
+2. Fund it with a small amount of MNT for gas.
+3. Paste that Proof Writer private key in the BlockScam dashboard.
+4. Enable **Verified On-chain Proof**.
+5. Click **Test Proof**.
+
+Security warning: users should never paste a main wallet private key. The Proof Writer wallet should only contain a small amount of MNT for gas.
+
+### Deploy the demo Validation Registry
+
+A lightweight ERC-8004-compatible demo validation registry is included:
+
+```bash
+npm run compile
+npm run deploy:validation
+```
+
+After deployment, copy the printed address into:
+
+```env
+ERC8004_VALIDATION_REGISTRY=0xYourDeployedValidationRegistry
+```
+
+For a quick demo, `ERC8004_VALIDATOR_ADDRESS` can be the Proof Writer wallet address or another fresh validator wallet.
