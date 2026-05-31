@@ -572,12 +572,24 @@ def clean_title(text: str) -> str:
     return text[:180]
 
 def normalize_text(text: str) -> str:
-    text = (text or "").lower()
+    """Normalize chat text for fast anti-scam matching.
+
+    This is intentionally stronger than normal content normalization:
+    - NFKC converts fullwidth/decorative unicode back to common characters.
+    - Vietnamese accents are removed so rules match both signed/unsigned text.
+    - Invisible/control characters are stripped to catch obfuscation.
+    """
+    text = str(text or "")
+    try:
+        text = unicodedata.normalize("NFKC", text)
+    except Exception:
+        pass
+    text = text.lower()
     text = "".join(
         c for c in unicodedata.normalize("NFD", text)
-        if unicodedata.category(c) != "Mn"
+        if unicodedata.category(c) != "Mn" and unicodedata.category(c)[0] != "C"
     )
-    for ch in ["\u200b", "\u200c", "\u200d", "\ufeff", "\xa0"]:
+    for ch in ["\u200b", "\u200c", "\u200d", "\ufeff", "\xa0", "\u2060"]:
         text = text.replace(ch, "")
     return text
 
@@ -3066,6 +3078,48 @@ class BlockScamService:
     def contains_risky(self, text: str) -> bool:
         return self.rule_based_risk(text)[0]
 
+    def compact_text(self, text: str) -> str:
+        return re.sub(r"[\s\W_]+", "", normalize_text(text or ""))
+
+    def quick_policy_hits(self, text: str) -> List[str]:
+        """Fast local policy copied from the original BlockScam bot.
+
+        This runs before AI and before any slower checks. It catches common
+        Vietnamese/English Telegram scams such as free USDT bait, trading team
+        invites, DM/admin inbox lures, seed/private-key phishing, and edited
+        obfuscation.
+        """
+        norm = normalize_text(text or "")
+        compact = self.compact_text(text or "")
+        hits: List[str] = []
+
+        checks = [
+            ("INVITE_SLOT", r"\b(mo|mở)\s*\d*\s*(slot|suat|suất)\b"),
+            ("INVITE_GROUP", r"\b(tham\s*gia|vao|vào|join)\b.{0,45}\b(nhom|nhóm|group|channel|trading|trade|signal)\b"),
+            ("INVEST_SOLICIT", r"\b(dau\s*tu|đầu\s*tư|investment|investing|copy\s*trade|copytrade|tin\s*hieu|tín\s*hiệu|signal|team\s*(futures|spot|trading)|mo\s*team|mở\s*team|futures\s*team)\b"),
+            ("PRIVATE_DM", r"\b(in\s*b\s*o\s*x|inbox|ib|pm|dm|nhan\s*tin\s*rieng|nhắn\s*tin\s*riêng|lien\s*he|liên\s*hệ|lh)\b"),
+            ("FREE_CRYPTO", r"\b(nhan|nhận|claim|lay|lấy|rut|rút|tang|tặng|giveaway|bonus)\b.{0,60}\b(usdt|usd|mnt|coin|token|airdrop|thuong|thưởng|qua|quà|free|mien\s*phi|miễn\s*phí)\b"),
+            ("FREE_CRYPTO", r"\b(usdt|usd|mnt|coin|token|airdrop)\b.{0,60}\b(free|mien\s*phi|miễn\s*phí|thuong|thưởng|bonus|giveaway)\b"),
+            ("WALLET_PHISH", r"\b(seed\s*phrase|private\s*key|khoa\s*rieng|khóa\s*riêng|12\s*tu|12\s*từ|24\s*tu|24\s*từ|connect\s*wallet|xac\s*minh\s*vi|xác\s*minh\s*ví|verify\s*(wallet|account)|otp|ma\s*otp|mã\s*otp)\b"),
+            ("FAKE_SUPPORT", r"\b(support|ho\s*tro|hỗ\s*trợ|admin|mod|cs|hotline)\b.{0,45}\b(binance|bybit|okx|telegram|zalo|whatsapp|wallet|vi|ví)\b"),
+            ("SHORTLINK", r"\b(bit\.ly|tinyurl\.com|goo\.gl|cut\.ly|cutt\.ly|is\.gd|s\.id|shorturl\.at)\b"),
+        ]
+        for name, pattern in checks:
+            if re.search(pattern, norm, re.I):
+                hits.append(name)
+
+        compact_checks = [
+            ("PRIVATE_DM", r"(inbox|ib|pm|dm|nhantinrieng|nhantin|lienhe|lhadmin|ibadmin)"),
+            ("FREE_CRYPTO", r"(freeusdt|usdtfree|nhanusdt|nhanusd|nhanmnt|claimusdt|claimairdrop|nhanairdrop|nhantoken|tangusdt)"),
+            ("INVEST_SOLICIT", r"(copytrade|teamfutures|moteam|nhomtrade|tinhieu|signalvip)"),
+            ("WALLET_PHISH", r"(seedphrase|privatekey|12tu|24tu|connectwallet|xacminhvi|maotp)"),
+        ]
+        for name, pattern in compact_checks:
+            if re.search(pattern, compact, re.I):
+                hits.append(name)
+
+        return list(dict.fromkeys(hits))
+
     def rule_based_risk(self, text: str) -> Tuple[bool, str, int, List[str]]:
         cfg = self.cfg_getter()
         keys = parse_lines(cfg.block_scam_keywords)
@@ -3088,6 +3142,8 @@ class BlockScamService:
             if nkc and nkc in compact:
                 matched.append("LINK_CONTEXT" if is_link_context else label)
                 continue
+
+        matched.extend(self.quick_policy_hits(text or ""))
 
         strong_patterns = [
             ("FREE_USDT_LURE", r"(mien phi|miễn phí|free|qua tang|quà tặng|airdrop).{0,45}(usdt|usd|mnt|tien|tiền|airdrop|thuong|thưởng|coin|token)"),
@@ -3135,6 +3191,22 @@ class BlockScamService:
             score = max(score, 92)
         if "SEED_PRIVATE_KEY_PHISH" in matched_set:
             score = max(score, 96)
+
+        # Original BlockScam-style instant actions. A plain link alone is still
+        # not enough because project/channel posts often contain links. These
+        # combined signals should be handled immediately without waiting for AI.
+        if "WALLET_PHISH" in matched_set:
+            score = max(score, 98)
+        if "FAKE_SUPPORT" in matched_set:
+            score = max(score, 94)
+        if "PRIVATE_DM" in matched_set and ("FREE_CRYPTO" in matched_set or "INVEST_SOLICIT" in matched_set or "LINK_CONTEXT" in matched_set or "SHORTLINK" in matched_set):
+            score = max(score, 94)
+        if "INVITE_GROUP" in matched_set and ("INVEST_SOLICIT" in matched_set or "FREE_CRYPTO" in matched_set or "SHORTLINK" in matched_set):
+            score = max(score, 92)
+        if "INVITE_SLOT" in matched_set and ("INVEST_SOLICIT" in matched_set or "PRIVATE_DM" in matched_set):
+            score = max(score, 90)
+        if "FREE_CRYPTO" in matched_set and ("LINK_CONTEXT" in matched_set or "SHORTLINK" in matched_set or "PRIVATE_DM" in matched_set):
+            score = max(score, 94)
         if "CONTACT_ME_PATTERN" in matched_set and "URGENT_INVITE" in matched_set and "LINK_CONTEXT" in matched_set:
             score = max(score, 88)
 
@@ -3298,27 +3370,9 @@ MESSAGE:
             return
 
         key = self.stable_message_key(chat_label, int(msg.id))
-        if key in processed_cache:
-            return
-        processed_cache.add(key)
-        if len(processed_cache) > 10000:
-            processed_cache.clear()
-
-        # DB repeat check is best-effort. Real-time moderation must not stall when
-        # SQLite is busy because another worker is saving settings/logs/proofs.
-        try:
-            if db.is_sent_message(key):
-                return
-        except Exception as e:
-            if verbose:
-                logger.warning(f"BlockScam duplicate check skipped due DB busy/error: {e}")
 
         protected, protected_reason = self.should_skip_protected_message(msg)
         if protected:
-            try:
-                db.mark_sent_message(key)
-            except Exception:
-                pass
             if verbose:
                 logger.info(f"🛡️ BlockScam skipped protected message ID {msg.id}: {protected_reason}")
             return
@@ -3330,12 +3384,26 @@ MESSAGE:
             or ""
         ).strip()
         if not text:
-            try:
-                db.mark_sent_message(key)
-            except Exception:
-                pass
             return
 
+        # processed_cache can be a dict so edited messages are re-checked when
+        # their text changes. This catches clean messages edited into scams.
+        fingerprint = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+        if isinstance(processed_cache, dict):
+            if processed_cache.get(key) == fingerprint:
+                return
+            processed_cache[key] = fingerprint
+            if len(processed_cache) > 20000:
+                processed_cache.clear()
+        else:
+            if key in processed_cache:
+                return
+            processed_cache.add(key)
+            if len(processed_cache) > 10000:
+                processed_cache.clear()
+
+        # DB repeat check is best-effort and intentionally skipped for edited
+        # messages in memory. Real-time moderation must not stall on SQLite.
         try:
             db.mark_sent_message(key)
         except Exception:
@@ -3390,10 +3458,240 @@ MESSAGE:
         except Exception as e:
             logger.warning(f"Could not create BlockScam proof: {e}")
 
+    def blockscam_bot_token(self) -> str:
+        # Use a dedicated BlockScam bot token when present. Reusing the social
+        # posting bot token is opt-in to avoid silently monitoring the wrong bot.
+        dedicated = os.getenv("BLOCKSCAM_BOT_TOKEN", "").strip()
+        if dedicated:
+            return dedicated
+        use_bot_api = os.getenv("BLOCKSCAM_USE_BOT_API", "auto").strip().lower()
+        if use_bot_api in {"1", "true", "yes", "on", "bot", "botapi", "bot_api"}:
+            cfg = self.cfg_getter()
+            return (getattr(cfg, "telegram_bot_token", "") or os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
+        return ""
+
+    def normalize_chat_ref(self, value: Any) -> str:
+        text = str(value or "").strip()
+        text = text.replace("https://t.me/", "").replace("http://t.me/", "").replace("t.me/", "")
+        text = text.split("?")[0].split("/")[0].strip()
+        if text.startswith("@"):
+            text = text[1:]
+        return text.lower()
+
+    def bot_api_chat_allowed(self, message: Any, allowed_refs: set[str]) -> bool:
+        if not allowed_refs:
+            return True
+        chat = getattr(message, "chat", None)
+        chat_id = str(getattr(chat, "id", "") or "").lower()
+        username = self.normalize_chat_ref(getattr(chat, "username", "") or "")
+        title = normalize_text(getattr(chat, "title", "") or "").strip()
+        return bool(
+            chat_id in allowed_refs
+            or username in allowed_refs
+            or (title and title in allowed_refs)
+        )
+
+    def should_skip_bot_api_message(self, message: Any) -> Tuple[bool, str]:
+        # Protect linked-channel reposts, forwarded content, service messages,
+        # and outgoing/admin-owned messages. This mirrors the Telethon safe-skip
+        # logic but uses aiogram message attributes.
+        skip_forwarded = os.getenv("BLOCKSCAM_SKIP_FORWARDED_POSTS", "1").strip().lower() not in {"0", "false", "no", "off"}
+        if getattr(message, "new_chat_members", None) or getattr(message, "left_chat_member", None) or getattr(message, "pinned_message", None):
+            return True, "telegram_service_message"
+        if skip_forwarded and getattr(message, "is_automatic_forward", False):
+            return True, "linked_channel_auto_forward"
+        if skip_forwarded and getattr(message, "forward_origin", None):
+            return True, "forwarded_message"
+        # sender_chat is commonly used by channels/pages posting into a group.
+        if skip_forwarded and getattr(message, "sender_chat", None):
+            return True, "sender_chat_or_channel_post"
+        return False, ""
+
+    async def is_bot_api_user_admin(self, bot: Any, chat_id: int, user_id: int) -> bool:
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+            return getattr(member, "status", "") in {"administrator", "creator"}
+        except Exception:
+            return False
+
+    async def safe_bot_api_delete(self, bot: Any, chat_id: int, message_id: int, retries: int = 2) -> bool:
+        for i in range(max(1, retries)):
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message_id)
+                return True
+            except Exception as e:
+                if i == retries - 1:
+                    logger.warning(f"BlockScam Bot API delete failed chat={chat_id} msg={message_id}: {e}")
+                await asyncio.sleep(0.15)
+        return False
+
+    async def safe_bot_api_ban(self, bot: Any, chat_id: int, user_id: int) -> bool:
+        if not user_id:
+            return False
+        try:
+            days = int(os.getenv("BLOCKSCAM_BAN_DURATION_DAYS", os.getenv("BAN_DURATION_DAYS", "0")) or "0")
+            until_date = datetime.now(timezone.utc) + timedelta(days=days) if days > 0 else None
+            await bot.ban_chat_member(chat_id=chat_id, user_id=user_id, until_date=until_date, revoke_messages=True)
+            return True
+        except Exception as e:
+            logger.warning(f"BlockScam Bot API ban failed chat={chat_id} user={user_id}: {e}")
+            return False
+
+    async def process_bot_api_message(self, *, bot: Any, message: Any, allowed_refs: set[str], processed_cache: set) -> None:
+        if not self.bot_api_chat_allowed(message, allowed_refs):
+            return
+        chat = getattr(message, "chat", None)
+        chat_id = getattr(chat, "id", None)
+        message_id = getattr(message, "message_id", None)
+        if not chat_id or not message_id:
+            return
+
+        key = self.stable_message_key(chat_id, int(message_id))
+        if key in processed_cache:
+            return
+        processed_cache.add(key)
+        if len(processed_cache) > 20000:
+            processed_cache.clear()
+
+        protected, protected_reason = self.should_skip_bot_api_message(message)
+        if protected:
+            return
+
+        from_user = getattr(message, "from_user", None)
+        sender_id = getattr(from_user, "id", None)
+        if sender_id and await self.is_bot_api_user_admin(bot, chat_id, sender_id):
+            return
+
+        text = " ".join([x for x in [getattr(message, "text", None), getattr(message, "caption", None)] if x]).strip()
+        if not text:
+            return
+        if not re.search(r"[a-zA-Z0-9À-ỹ]", text):
+            return
+
+        # Rules first: instant path. AI is optional and only used if rules are not decisive.
+        should_delete, risk_reason, risk_score, matched_rules = await self.should_delete_message_async(text)
+        if not should_delete:
+            return
+
+        chat_label = str(getattr(chat, "username", None) or getattr(chat, "title", None) or chat_id)
+        logger.warning(f"🚫 BlockScam detected scam fast-bot | chat={chat_label} | score={risk_score} | reason={risk_reason} | text={text[:100]}")
+
+        cfg = self.cfg_getter()
+        min_onchain_score = int(getattr(cfg, "erc8004_onchain_min_score", 70) or 70)
+        block_user_min_score = int(os.getenv("BLOCKSCAM_BLOCK_USER_MIN_SCORE", "90") or "90")
+
+        deleted = await self.safe_bot_api_delete(bot, chat_id, int(message_id))
+        action = "delete_message" if deleted else "detect_only"
+        blocked = False
+        if int(risk_score or 0) >= block_user_min_score and sender_id:
+            blocked = await self.safe_bot_api_ban(bot, chat_id, int(sender_id))
+            if blocked and deleted:
+                action = "delete_message_and_block_user"
+            elif blocked:
+                action = "block_user"
+            elif deleted:
+                action = "delete_message_block_failed"
+
+        try:
+            proof_hash, tx_hash = await asyncio.to_thread(
+                self.create_moderation_proof_sync,
+                chat=str(chat_label),
+                message_id=int(message_id),
+                sender_id=sender_id,
+                text=text,
+                action=action,
+                risk_score=int(risk_score or 0),
+                risk_reason=risk_reason,
+                matched_rules=matched_rules,
+                min_onchain_score=min_onchain_score,
+            )
+            logger.info(f"🧾 BlockScam proof created | score={risk_score} | hash={proof_hash} | tx={tx_hash or 'local-only'}")
+        except Exception as e:
+            logger.warning(f"Could not create BlockScam proof: {e}")
+
+    async def run_bot_api_fast_monitor(self, stop_event: threading.Event) -> bool:
+        """Fast BlockScam mode based on the original aiogram bot.
+
+        It is optional. If a BotFather token is configured, this path is much
+        faster and avoids Telethon session locks. If not configured or import
+        fails, the caller falls back to the Telethon user-session monitor.
+        """
+        token = self.blockscam_bot_token()
+        if not token:
+            return False
+        use_bot_api = os.getenv("BLOCKSCAM_USE_BOT_API", "auto").strip().lower()
+        if use_bot_api in {"0", "false", "no", "off", "telethon"}:
+            return False
+        try:
+            from aiogram import Bot, Dispatcher
+            from aiogram.client.default import DefaultBotProperties
+            from aiogram.enums import ParseMode
+        except Exception as e:
+            logger.warning(f"BlockScam Bot API fast mode unavailable, falling back to Telethon. Install aiogram. error={e}")
+            return False
+
+        cfg = self.cfg_getter()
+        chats = parse_lines(cfg.block_scam_target_chats)
+        allowed_refs = {self.normalize_chat_ref(x) for x in chats if self.normalize_chat_ref(x)}
+        allowed_refs.update({str(x).lower() for x in chats if str(x).strip().lstrip("-").isdigit()})
+
+        bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        dp = Dispatcher()
+        processed_cache: set = set()
+
+        @dp.message()
+        async def _on_message(message):
+            try:
+                await self.process_bot_api_message(bot=bot, message=message, allowed_refs=allowed_refs, processed_cache=processed_cache)
+            except Exception as e:
+                logger.warning(f"BlockScam fast-bot message handler error: {e}")
+
+        @dp.edited_message()
+        async def _on_edited_message(message):
+            try:
+                # Edited clean-to-scam messages are common. Re-process even if the
+                # original message ID was seen by removing the cache key first.
+                chat_id = getattr(getattr(message, "chat", None), "id", None)
+                mid = getattr(message, "message_id", None)
+                if chat_id and mid:
+                    processed_cache.discard(self.stable_message_key(chat_id, int(mid)))
+                await self.process_bot_api_message(bot=bot, message=message, allowed_refs=allowed_refs, processed_cache=processed_cache)
+            except Exception as e:
+                logger.warning(f"BlockScam fast-bot edited handler error: {e}")
+
+        logger.info("🛡️ BlockScam fast Bot API monitor started. It reacts by Telegram updates, not slow polling.")
+        poll_task = asyncio.create_task(dp.start_polling(bot, allowed_updates=["message", "edited_message"]))
+        try:
+            while not stop_event.is_set():
+                if poll_task.done():
+                    exc = poll_task.exception()
+                    if exc:
+                        logger.warning(f"BlockScam fast Bot API monitor stopped with error: {exc}")
+                    break
+                await asyncio.sleep(0.25)
+        finally:
+            try:
+                await dp.stop_polling()
+            except Exception:
+                pass
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
+            if not poll_task.done():
+                poll_task.cancel()
+            logger.info("BlockScam fast Bot API monitor stopped.")
+        return True
+
     async def run_basic_monitor(self, stop_event: threading.Event):
         cfg = self.cfg_getter()
         if not cfg.enable_block_scam:
             logger.info("BlockScam is disabled.")
+            return
+
+        # Fastest path: original BlockScam-style Bot API polling. Optional.
+        # Enable with BLOCKSCAM_BOT_TOKEN or BLOCKSCAM_USE_BOT_API=1.
+        if await self.run_bot_api_fast_monitor(stop_event):
             return
 
         api_id, api_hash = self.telegram_service.api_pair()
@@ -3419,7 +3717,7 @@ MESSAGE:
         verbose = os.getenv("BLOCKSCAM_VERBOSE", "0").strip().lower() in {"1", "true", "yes", "on"}
         startup_backfill_limit = max(0, int(os.getenv("BLOCKSCAM_STARTUP_BACKFILL_LIMIT", "20") or "20"))
         health_interval = max(0, int(os.getenv("BLOCKSCAM_HEALTH_LOG_SECONDS", "0") or "0"))
-        processed_cache: set = set()
+        processed_cache: Dict[int, str] = {}
         resolved_chats: List[Tuple[Any, str]] = []
 
         for chat in chats:
@@ -3452,8 +3750,24 @@ MESSAGE:
             except Exception as e:
                 logger.error(f"BlockScam realtime handler error: {e}")
 
+        async def handle_edit_event(event):
+            try:
+                chat_entity = await event.get_chat()
+                chat_label = str(getattr(chat_entity, "username", None) or getattr(chat_entity, "title", None) or event.chat_id)
+                await self.process_candidate_message(
+                    client=client,
+                    chat_entity=chat_entity,
+                    chat_label=chat_label,
+                    msg=event.message,
+                    processed_cache=processed_cache,
+                    verbose=verbose,
+                )
+            except Exception as e:
+                logger.error(f"BlockScam realtime edit handler error: {e}")
+
         chat_entities = [entity for entity, _ in resolved_chats]
         client.add_event_handler(handle_event, events.NewMessage(chats=chat_entities))
+        client.add_event_handler(handle_edit_event, events.MessageEdited(chats=chat_entities))
 
         # Backfill a small recent window on startup only. After that, moderation is
         # event-driven and reacts to Telegram updates immediately instead of polling
@@ -3474,16 +3788,45 @@ MESSAGE:
                 except Exception as e:
                     logger.warning(f"BlockScam startup backfill failed for {label}: {e}")
 
+        # Telethon update events are fast when Telegram delivers them. Some
+        # hosted environments miss updates or process them late, so keep a tiny
+        # recent-message scanner as a safety net. This is much faster than the
+        # old 30-second polling and does not log clean messages.
+        fast_scan_interval = float(os.getenv("BLOCKSCAM_FAST_SCAN_SECONDS", "0.8") or "0.8")
+        fast_scan_limit = max(1, int(os.getenv("BLOCKSCAM_FAST_SCAN_LIMIT", "6") or "6"))
+        last_fast_scan = 0.0
         last_health = time.time()
         try:
             while not stop_event.is_set():
-                await asyncio.sleep(0.25)
+                now = time.time()
+                if fast_scan_interval > 0 and now - last_fast_scan >= fast_scan_interval:
+                    last_fast_scan = now
+                    for entity, label in resolved_chats:
+                        try:
+                            recent = await client.get_messages(entity, limit=fast_scan_limit)
+                            for msg in reversed(recent):
+                                await self.process_candidate_message(
+                                    client=client,
+                                    chat_entity=entity,
+                                    chat_label=label,
+                                    msg=msg,
+                                    processed_cache=processed_cache,
+                                    verbose=False,
+                                )
+                        except FloodWaitError as e:
+                            logger.warning(f"BlockScam fast scan flood-wait for {getattr(e, 'seconds', 1)}s")
+                            await asyncio.sleep(min(int(getattr(e, 'seconds', 1)), 5))
+                        except Exception as e:
+                            if verbose:
+                                logger.warning(f"BlockScam fast scan skipped for {label}: {e}")
+                await asyncio.sleep(0.08)
                 if health_interval > 0 and time.time() - last_health >= health_interval:
                     last_health = time.time()
                     logger.info("🛡️ BlockScam real-time monitor alive.")
         finally:
             try:
                 client.remove_event_handler(handle_event)
+                client.remove_event_handler(handle_edit_event)
             except Exception:
                 pass
             await client.disconnect()
