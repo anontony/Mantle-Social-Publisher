@@ -941,7 +941,7 @@ def public_base_url() -> str:
     Railway may serve the app from an internal *.up.railway.app domain while
     users and validators should open evidence through the public/custom domain.
     Set ERC8004_EVIDENCE_BASE_URL to something like:
-    https://cignews.space/Mantle-Social-Publisher
+    https://your-custom-domain.example
     """
     base = (getattr(cfg, "erc8004_evidence_base_url", "") or os.getenv("APP_PUBLIC_BASE_URL", "") or "").strip()
     return base.rstrip("/")

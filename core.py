@@ -7,7 +7,6 @@ import json
 import time
 import base64
 import hashlib
-import mimetypes
 import shutil
 import queue
 import random
@@ -1136,7 +1135,14 @@ SOURCE DATA:
             return score >= int(getattr(cfg, "image_min_score", 9) or 9)
         return True
 
-    def create_image(self, title: str, score: int = 10) -> Optional[bytes]:
+    def create_image(
+        self,
+        title: str,
+        score: int = 10,
+        article_html: str = "",
+        social_summary: str = "",
+        source_news: Optional[Dict[str, Any]] = None,
+    ) -> Optional[bytes]:
         cfg = self.cfg_getter()
         if not self.should_generate_image(score):
             logger.info("🎨 Featured image skipped by cost policy.")
@@ -1147,19 +1153,42 @@ SOURCE DATA:
         quality = getattr(cfg, "image_quality", "low") or "low"
         size = getattr(cfg, "image_size", "1536x1024") or "1536x1024"
 
-        prompt = f"""
-Create a clear, high-contrast editorial featured image for a financial news article.
+        source_title = ""
+        if isinstance(source_news, dict):
+            source_title = str(source_news.get("title") or "").strip()
+        article_context = strip_html(article_html or "")[:1400].strip()
+        summary_context = strip_html(social_summary or "")[:700].replace("{{LINK}}", "").strip()
 
-Headline:
+        prompt = f"""
+Create ONE premium photorealistic editorial image for a crypto or financial news article.
+
+Final article headline:
 {title}
 
-Visual direction:
-- 16:9 news-thumbnail composition.
-- Abstract financial markets, crypto market charts, candlestick motion, macro finance symbols, data grids, risk/volatility mood.
-- Strong foreground subject, clean depth, premium fintech editorial style.
-- No real people, no faces, no hands.
-- No readable text, no logos, no watermark, no brand names.
-- Must not be blank, plain, or mostly empty.
+Original source headline:
+{source_title}
+
+Article/social context:
+{summary_context or article_context}
+
+Creative direction:
+- Make the image look realistic, cinematic, and news-editorial, like a premium finance/crypto media hero image.
+- The visual idea must directly match the headline and the market story, not a generic crypto wallpaper.
+- Build one clear scene with a strong subject, believable environment, realistic lighting, realistic textures, and modern financial-news atmosphere.
+- Use real-world visual cues when relevant: trader workstation, market screens, institutional finance desk, city financial district, cybersecurity command center, blockchain infrastructure, macroeconomic setting, or regulatory/central-bank mood.
+- For bearish or risk news, show uncertainty, pressure, volatility, red market screens, or defensive market sentiment.
+- For bullish or recovery news, show momentum, confidence, institutional interest, green market screens, or constructive market sentiment.
+- For scam/security news, show realistic cybersecurity defense, suspicious messages, digital risk, and AI protection.
+- Keep the composition clean, premium, and suitable as a WordPress featured image and social preview.
+
+Strictly avoid:
+- Cartoon, anime, flat illustration, cheap 3D coin renders, or generic floating icons.
+- Cluttered collages, excessive symbolism, fake UI, fake charts with readable numbers, or infographic layouts.
+- Any readable text, logos, brand names, watermarks, QR codes, UI labels, or captions inside the image.
+- Identifiable real people, celebrity likenesses, political figures, or close-up faces. If people are needed, show non-identifiable silhouettes, backs, or hands only.
+- Empty backgrounds or images that are mostly blank.
+
+Output style: photorealistic editorial finance/crypto news cover image, realistic and emotionally clear.
 """
         try:
             res = client.images.generate(
@@ -1352,7 +1381,7 @@ LINK:
         logger.info(f"📰 New title: {title_new}")
 
         logger.info("🎨 Checking featured-image cost policy...")
-        img = self.create_image(title_new, best_score)
+        img = self.create_image(title_new, best_score, article, summary_template, best_news)
         image_path = self.save_social_image(img, title_new)
         img_id = self.upload_image(img)
         image_url = self.last_uploaded_image_url
@@ -1631,150 +1660,6 @@ class PlaywrightSocialService:
             return f"{body}\n{url}"[:1024].rstrip()
         return self._shorten_at_word(text, 1024)
 
-    def _facebook_caption(self, text: str) -> str:
-        """Prepare a safe Facebook caption for Graph API photo posts.
-
-        Facebook /photos is more fragile when the payload is very large. Keep
-        the caption useful, avoid excessive hashtags, and never send an
-        unnecessarily huge text field with the image upload.
-        """
-        caption = re.sub(r"\s+", " ", (text or "").strip())
-
-        try:
-            max_chars = int(os.getenv("FACEBOOK_CAPTION_MAX_CHARS", "1800") or "1800")
-        except Exception:
-            max_chars = 1800
-        max_chars = max(300, min(max_chars, 5000))
-
-        if len(caption) > max_chars:
-            cut = caption[:max_chars].rstrip()
-            if " " in cut:
-                cut = cut.rsplit(" ", 1)[0].rstrip()
-            caption = cut + "…"
-
-        # Too many hashtags/mentions can make Meta reject or throttle posts in
-        # ways that show up as a generic HTTP 500. Keep the first few only.
-        try:
-            max_hashtags = int(os.getenv("FACEBOOK_MAX_HASHTAGS", "8") or "8")
-        except Exception:
-            max_hashtags = 8
-        max_hashtags = max(0, min(max_hashtags, 20))
-
-        parts = caption.split()
-        kept = []
-        hashtag_count = 0
-        for part in parts:
-            if part.startswith("#"):
-                hashtag_count += 1
-                if hashtag_count > max_hashtags:
-                    continue
-            kept.append(part)
-
-        return " ".join(kept).strip()
-
-    def _facebook_recent_matching_post(self, version: str, page_id: str, token: str, caption: str) -> dict | None:
-        """Check recent Page feed posts to prevent duplicate retries after Meta 500.
-
-        Meta can return a transient server error even when the post was created.
-        This lightweight check uses only small fields and compares a caption hint.
-        """
-        hint = re.sub(r"\s+", " ", (caption or "").strip())[:100]
-        if not hint:
-            return None
-        try:
-            feed = self._facebook_get_json(
-                version,
-                f"{page_id}/feed",
-                token,
-                params={"fields": "id,created_time,permalink_url,message", "limit": "8"},
-                timeout=30,
-            )
-            for item in feed.get("data", []) if isinstance(feed, dict) else []:
-                msg = re.sub(r"\s+", " ", str(item.get("message") or "").strip())
-                if hint and (hint in msg or msg[:100] in hint):
-                    if item.get("permalink_url"):
-                        item["verified_permalink_url"] = item.get("permalink_url")
-                    logger.warning("⚠️ Facebook returned an error, but a matching recent Page post exists: %s", json.dumps(item, ensure_ascii=False)[:800])
-                    return item
-        except Exception as e:
-            logger.warning("Facebook recent-post duplicate check failed: %s", e)
-        return None
-
-    def _facebook_prepare_image_upload(self, image_path: str) -> tuple[str, str, bool]:
-        """Return an image path and MIME type suitable for Facebook upload.
-
-        Generated PNGs can be several MB and are a common cause of generic Meta
-        HTTP 500 responses. If Pillow is available, convert to optimized JPEG
-        under FACEBOOK_IMAGE_MAX_MB. If conversion fails, fall back to the
-        original image instead of breaking other social flows.
-        """
-        original = Path(str(image_path))
-        mime_type = mimetypes.guess_type(str(original))[0] or "image/png"
-        created_temp = False
-
-        if not original.exists() or not original.is_file():
-            return str(original), mime_type, created_temp
-
-        try:
-            max_mb = float(os.getenv("FACEBOOK_IMAGE_MAX_MB", "3.5") or "3.5")
-        except Exception:
-            max_mb = 3.5
-        max_bytes = int(max(0.5, min(max_mb, 4.0)) * 1024 * 1024)
-
-        try:
-            if original.stat().st_size <= max_bytes and mime_type in {"image/jpeg", "image/jpg", "image/png", "image/webp"}:
-                logger.info("Facebook image upload file: %s | %.2f MB | %s", original.name, original.stat().st_size / 1024 / 1024, mime_type)
-                return str(original), mime_type, created_temp
-        except Exception:
-            pass
-
-        try:
-            from PIL import Image
-
-            with Image.open(original) as img:
-                img = img.convert("RGB")
-
-                try:
-                    max_side = int(os.getenv("FACEBOOK_IMAGE_MAX_SIDE", "1600") or "1600")
-                except Exception:
-                    max_side = 1600
-                max_side = max(800, min(max_side, 2048))
-
-                w, h = img.size
-                if max(w, h) > max_side:
-                    ratio = max_side / max(w, h)
-                    img = img.resize((max(1, int(w * ratio)), max(1, int(h * ratio))), Image.LANCZOS)
-
-                digest = hashlib.sha256(original.read_bytes()).hexdigest()[:12]
-                upload_path = SOCIAL_IMAGE_DIR / f"facebook-upload-{int(time.time())}-{digest}.jpg"
-
-                quality = 88
-                while quality >= 60:
-                    img.save(upload_path, "JPEG", quality=quality, optimize=True, progressive=True)
-                    if upload_path.stat().st_size <= max_bytes:
-                        break
-                    quality -= 6
-
-            created_temp = True
-            logger.info(
-                "Facebook image optimized: %s -> %s | %.2f MB -> %.2f MB",
-                original.name,
-                upload_path.name,
-                original.stat().st_size / 1024 / 1024,
-                upload_path.stat().st_size / 1024 / 1024,
-            )
-            return str(upload_path), "image/jpeg", created_temp
-
-        except Exception as e:
-            logger.warning("Facebook image optimization skipped; uploading original file. Reason: %s", e)
-            return str(original), mime_type, created_temp
-
-    def _facebook_post_response_json(self, response: requests.Response, *, action: str) -> dict:
-        try:
-            return response.json()
-        except Exception:
-            raise RuntimeError(f"Facebook Graph API {action} returned non-JSON response: {response.text[:300]}")
-
     def _valid_image_path(self, image_path: str | None) -> str:
         if not image_path:
             return ""
@@ -1897,20 +1782,11 @@ class PlaywrightSocialService:
         )
         return result
 
-    def post_facebook_graph_api(
-        self,
-        text: str,
-        page_id: str,
-        page_access_token: str,
-        image_path: str | None = None,
-        image_url: str | None = None,
-    ):
+    def post_facebook_graph_api(self, text: str, page_id: str, page_access_token: str, image_path: str | None = None):
         version = os.getenv("META_GRAPH_API_VERSION", "v24.0").strip() or "v24.0"
         page_id = str(page_id or "").strip()
         page_access_token = str(page_access_token or "").strip()
         image_path = self._valid_image_path(image_path)
-        image_url = str(image_url or "").strip()
-        caption = self._facebook_caption(text)
 
         if not page_id or not page_access_token:
             raise RuntimeError("Facebook Page ID or Page Access Token is empty.")
@@ -1924,144 +1800,48 @@ class PlaywrightSocialService:
         )
         logger.info("Facebook target Page verified: id=%s name=%s link=%s", page_info.get("id"), page_info.get("name"), page_info.get("link"))
 
-        max_retries = 3
-        try:
-            max_retries = max(1, min(int(os.getenv("FACEBOOK_POST_RETRIES", "3") or "3"), 5))
-        except Exception:
-            max_retries = 3
-
-        if image_path or image_url:
+        if image_path:
             url = self._facebook_graph_url(version, f"{page_id}/photos")
-            last_error = ""
-            prepared_path = ""
-            prepared_temp = False
-
-            # Prefer posting by the already uploaded WordPress image URL when
-            # available. This sends much less multipart data to Meta. If the URL
-            # is private/unreachable, we fall back to local file upload.
-            use_image_url_first = bool(image_url) and env_bool("FACEBOOK_PREFER_IMAGE_URL", True)
-            modes = []
-            if use_image_url_first:
-                modes.append("url")
-            if image_path:
-                modes.append("file")
-            if image_url and "url" not in modes:
-                modes.append("url")
-
+            with open(image_path, "rb") as f:
+                r = requests.post(
+                    url,
+                    data={
+                        "message": (text or "").strip(),
+                        "access_token": page_access_token,
+                        "published": "true",
+                    },
+                    files={"source": (Path(image_path).name, f, "image/png")},
+                    timeout=60,
+                )
+            if r.status_code not in (200, 201):
+                raise RuntimeError(f"Facebook Graph API photo post failed: HTTP {r.status_code} | {r.text[:500]}")
             try:
-                for mode in modes:
-                    for attempt in range(1, max_retries + 1):
-                        try:
-                            if mode == "url":
-                                r = requests.post(
-                                    url,
-                                    data={
-                                        "caption": caption,
-                                        "url": image_url,
-                                        "access_token": page_access_token,
-                                        "published": "true",
-                                    },
-                                    timeout=90,
-                                )
-                            else:
-                                if not prepared_path:
-                                    prepared_path, mime_type, prepared_temp = self._facebook_prepare_image_upload(image_path)
-                                else:
-                                    mime_type = mimetypes.guess_type(prepared_path)[0] or "image/jpeg"
-
-                                with open(prepared_path, "rb") as f:
-                                    r = requests.post(
-                                        url,
-                                        data={
-                                            "caption": caption,
-                                            "access_token": page_access_token,
-                                            "published": "true",
-                                        },
-                                        files={"source": (Path(prepared_path).name, f, mime_type)},
-                                        timeout=120,
-                                    )
-
-                            if r.status_code in (200, 201):
-                                result = self._facebook_post_response_json(r, action="photo post")
-                                verified = self._facebook_verify_publish(version, page_id, page_access_token, result, had_image=True)
-                                logger.info("✅ Posted image + text to Facebook Page via Graph API and verified the published object.")
-                                return verified
-
-                            last_error = f"HTTP {r.status_code} | {r.text[:500]}"
-                            logger.error(
-                                "Facebook Graph API photo post failed mode=%s attempt=%s/%s: %s",
-                                mode,
-                                attempt,
-                                max_retries,
-                                last_error,
-                            )
-
-                            if r.status_code >= 500:
-                                existing = self._facebook_recent_matching_post(version, page_id, page_access_token, caption)
-                                if existing:
-                                    return existing
-
-                            if attempt < max_retries and r.status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
-                                time.sleep(6 * attempt)
-                                continue
-                            break
-
-                        except Exception as e:
-                            last_error = str(e)
-                            logger.error(
-                                "Facebook Graph API photo post exception mode=%s attempt=%s/%s: %s",
-                                mode,
-                                attempt,
-                                max_retries,
-                                e,
-                            )
-                            existing = self._facebook_recent_matching_post(version, page_id, page_access_token, caption)
-                            if existing:
-                                return existing
-                            if attempt < max_retries:
-                                time.sleep(6 * attempt)
-                                continue
-                            break
-
-                raise RuntimeError(f"Facebook Graph API photo post failed after retry/fallback: {last_error}")
-
-            finally:
-                if prepared_temp and prepared_path:
-                    try:
-                        Path(prepared_path).unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                result = r.json()
+            except Exception:
+                raise RuntimeError(f"Facebook Graph API photo post returned non-JSON response: {r.text[:300]}")
+            verified = self._facebook_verify_publish(version, page_id, page_access_token, result, had_image=True)
+            logger.info("✅ Posted image + text to Facebook Page via Graph API and verified the published object.")
+            return verified
 
         url = self._facebook_graph_url(version, f"{page_id}/feed")
-        last_error = ""
-        for attempt in range(1, max_retries + 1):
-            r = requests.post(
-                url,
-                data={
-                    "message": caption,
-                    "access_token": page_access_token,
-                    "published": "true",
-                },
-                timeout=45,
-            )
-            if r.status_code in (200, 201):
-                result = self._facebook_post_response_json(r, action="post")
-                verified = self._facebook_verify_publish(version, page_id, page_access_token, result, had_image=False)
-                logger.info("✅ Posted text to Facebook Page via Graph API and verified the published object.")
-                return verified
-
-            last_error = f"HTTP {r.status_code} | {r.text[:500]}"
-            logger.error("Facebook Graph API post failed attempt=%s/%s: %s", attempt, max_retries, last_error)
-            if r.status_code >= 500:
-                existing = self._facebook_recent_matching_post(version, page_id, page_access_token, caption)
-                if existing:
-                    return existing
-            if attempt < max_retries and r.status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
-                time.sleep(6 * attempt)
-                continue
-            break
-
-        raise RuntimeError(f"Facebook Graph API post failed after retry: {last_error}")
+        r = requests.post(
+            url,
+            data={
+                "message": (text or "").strip(),
+                "access_token": page_access_token,
+                "published": "true",
+            },
+            timeout=30,
+        )
+        if r.status_code not in (200, 201):
+            raise RuntimeError(f"Facebook Graph API post failed: HTTP {r.status_code} | {r.text[:500]}")
+        try:
+            result = r.json()
+        except Exception:
+            raise RuntimeError(f"Facebook Graph API post returned non-JSON response: {r.text[:300]}")
+        verified = self._facebook_verify_publish(version, page_id, page_access_token, result, had_image=False)
+        logger.info("✅ Posted text to Facebook Page via Graph API and verified the published object.")
+        return verified
 
     async def _try_click_or_shortcut(self, page, selectors: List[str], *, platform: str, timeout: int = 7000, allow_shortcut: bool = True) -> bool:
         """Click known publish buttons.
@@ -2239,7 +2019,7 @@ class PlaywrightSocialService:
                 "Facebook cookie/browser posting has been removed."
             )
 
-        await asyncio.to_thread(self.post_facebook_graph_api, text, page_id, page_access_token, image_path, image_url)
+        await asyncio.to_thread(self.post_facebook_graph_api, text, page_id, page_access_token, image_path)
 
 
 
