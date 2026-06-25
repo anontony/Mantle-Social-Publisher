@@ -1013,7 +1013,9 @@ def page_shell(tab: str, title: str, content: str, message: str = "", user: Opti
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
 <title>{esc(APP_NAME)}</title>
+<style id="boot-theme">html,body{{background:#08070c!important;color:#f8f4ff!important;}}</style>
 <style>
 :root {{
   --bg0:#08070c;
@@ -1035,9 +1037,10 @@ def page_shell(tab: str, title: str, content: str, message: str = "", user: Opti
   --shadow2:0 12px 30px rgba(255,0,122,.18);
 }}
 *{{box-sizing:border-box}}
-html{{scroll-behavior:smooth;overflow-x:hidden}}
+html{{scroll-behavior:smooth;overflow-x:hidden;background:#08070c;color-scheme:dark}}
 body{{
   margin:0;
+  background-color:#08070c;
   overflow-x:hidden;
   font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;
   color:var(--text);
@@ -1153,6 +1156,9 @@ option{{background:#14121e;color:var(--text)}}
 
 .mobile-topbar{{display:none}}
 .mobile-overlay{{display:none}}
+body.app-navigating{{cursor:progress;background:#08070c!important}}
+body.app-navigating .main{{opacity:.72;filter:saturate(.92);transition:opacity .12s ease,filter .12s ease}}
+body.app-navigating:after{{content:"Loading...";position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(8,7,12,.96);color:#f8f4ff;font-size:15px;font-weight:950;letter-spacing:.02em;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}}
 .mobile-title{{font-size:15px;font-weight:950;letter-spacing:-.02em}}
 .mobile-menu-btn{{width:44px;min-height:44px;padding:0;border-radius:15px;font-size:20px}}
 .mobile-wallet{{font-size:12px;color:var(--muted);font-weight:900;max-width:112px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}}
@@ -1401,9 +1407,24 @@ document.addEventListener('DOMContentLoaded', () => {{
   const sidebar = document.querySelector('.sidebar');
   if (overlay) overlay.addEventListener('click', closeMenu);
   if (sidebar) sidebar.addEventListener('click', (event) => event.stopPropagation());
-  document.querySelectorAll('.sidebar .nav').forEach((link) => link.addEventListener('click', () => {{
-    document.body.classList.remove('menu-open');
-  }}));
+  document.querySelectorAll('.sidebar .nav').forEach((link) => {{
+    const prefetch = () => {{
+      if (link.dataset.prefetched === '1') return;
+      link.dataset.prefetched = '1';
+      try {{ fetch(link.href, {{ credentials: 'same-origin', cache: 'force-cache' }}).catch(() => {{}}); }} catch (_) {{}}
+    }};
+    link.addEventListener('mouseenter', prefetch);
+    link.addEventListener('touchstart', prefetch, {{ passive: true }});
+    link.addEventListener('click', (event) => {{
+      document.body.classList.remove('menu-open');
+      if (link.classList.contains('active')) {{
+        event.preventDefault();
+        return;
+      }}
+      document.documentElement.style.backgroundColor = '#08070c';
+      document.body.classList.add('app-navigating');
+    }});
+  }});
 
   document.querySelectorAll('.secret-toggle').forEach((button) => {{
     button.addEventListener('click', () => {{
