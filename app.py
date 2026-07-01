@@ -2135,9 +2135,9 @@ def login_content() -> str:
       <label>API Hash</label>{secret_input("telegram_api_hash", cfg.telegram_api_hash)}
       <label>Session name</label><input name="telegram_session_name" value="{esc(cfg.telegram_session_name)}">
       <label>Phone</label><input name="telegram_phone" value="{esc(cfg.telegram_phone)}">
-      <label>Telegram posting channel</label><input name="telegram_post_channel_url" value="{esc(getattr(cfg, 'telegram_post_channel_url', ''))}" placeholder="@yourchannel or https://t.me/yourchannel">
+      <label>Telegram posting channel / group / topic</label><input name="telegram_post_channel_url" value="{esc(getattr(cfg, 'telegram_post_channel_url', ''))}" placeholder="@yourgroup|456 or -1001234567890|456">
       <label>Telegram Bot Token (preferred API posting)</label>{secret_input("telegram_bot_token", getattr(cfg, 'telegram_bot_token', ''), "Optional BotFather token") }
-      <label>Telegram Bot Chat IDs</label><textarea name="telegram_bot_chat_ids" placeholder="@yourchannel or -1001234567890, one per line">{esc(getattr(cfg, 'telegram_bot_chat_ids', ''))}</textarea>
+      <label>Telegram Bot Chat IDs / Topics</label><textarea name="telegram_bot_chat_ids" placeholder="@yourchannel or -1001234567890|456, one per line">{esc(getattr(cfg, 'telegram_bot_chat_ids', ''))}</textarea>
     </div>
     <div class="actions"><button class="primary">Save Telegram</button></div>
   </form>
@@ -2148,8 +2148,9 @@ def login_content() -> str:
         <li>Go to <code>my.telegram.org</code> and sign in with the Telegram account that will manage your groups or channels.</li>
         <li>Open <b>API development tools</b>, create an app, then copy the <b>API ID</b> and <b>API Hash</b>.</li>
         <li>Paste the API ID, API Hash, phone number, and session name in this form.</li>
-        <li>For social posting, enter a Telegram channel or group such as <code>@yourchannel</code> or <code>https://t.me/yourchannel</code>.</li>
-        <li>Preferred option: create a bot with <code>@BotFather</code>, add it as admin/member in the target channel/group, then paste the bot token and chat IDs. This avoids browser button-click issues.</li>
+        <li>For social posting, enter a Telegram channel, group, or forum topic. Normal target: <code>@yourchannel</code>. Topic target: <code>@yourgroup|456</code> or <code>-1001234567890|456</code>.</li>
+        <li>The number after <code>|</code> is the Telegram topic/thread ID. For Bot API, it is sent as <code>message_thread_id</code>. For Telethon, it is used as the topic starter reply target.</li>
+        <li>Preferred option: create a bot with <code>@BotFather</code>, add it as admin/member in the target channel/group, then paste the bot token and chat IDs. This supports forum topics when the target is written as <code>chat_id|topic_id</code>.</li>
         <li>Click <b>Save Telegram</b>, then <b>Send Telegram Code</b>. Enter the code received in Telegram and your 2FA password if Telegram asks for it.</li>
         <li>Click <b>Test Session</b>. Make sure the Telegram account has permission to post, delete messages, and ban users in the target groups if BlockScam is enabled.</li>
       </ol>
@@ -2266,8 +2267,11 @@ def forward_content() -> str:
   <div class="checkrow"><label><input type="checkbox" name="enable_telegram_forward" {checked('enable_telegram_forward')}> Enable Telegram Forward</label></div>
   <div class="grid">
     <label>Source channel</label><input name="telegram_source_channel" value="{esc(cfg.telegram_source_channel)}">
-    <label>Target Channels, one per line</label><textarea name="telegram_target_channels">{esc(cfg.telegram_target_channels)}</textarea>
+    <label>Target Channels / Groups / Topics, one per line</label><textarea name="telegram_target_channels" placeholder="@yourchannel
+@yourgroup|456
+-1001234567890|456">{esc(cfg.telegram_target_channels)}</textarea>
   </div>
+  <p class="help">Telegram topics are supported with <code>chat|topic_id</code>, for example <code>@yourgroup|456</code> or <code>-1001234567890|456</code>. A topic is not a separate chat, so the topic ID is required.</p>
   <div class="actions"><button class="primary">Save Configuration</button></div>
 </div>
 </form>

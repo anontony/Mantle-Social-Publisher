@@ -322,7 +322,17 @@ Required:
 - Telegram API Hash.
 - Session name.
 - Phone number.
-- Optional Telegram posting channel.
+- Optional Telegram posting channel/group/topic.
+
+Telegram forum topics are supported with `chat|topic_id` syntax, for example:
+
+```text
+@yourgroup|456
+-1001234567890|456
+https://t.me/yourgroup|456
+```
+
+The `topic_id` is Telegram's forum `message_thread_id`. For Bot API posting, the app sends it as `message_thread_id`; for Telethon posting/forwarding, it is used as the topic reply target.
 
 Flow:
 
@@ -334,7 +344,7 @@ Flow:
 6. Click **Confirm Code**.
 7. Click **Test Session**.
 
-The Telegram account must have permission to post, delete messages, and ban users in target groups if BlockScam is enabled.
+The Telegram account must have permission to post, delete messages, and ban users in target groups if BlockScam is enabled. For topic posting, make sure the Telegram account or bot is a member/admin of the supergroup and can post in the selected topic.
 
 #### X / Twitter
 

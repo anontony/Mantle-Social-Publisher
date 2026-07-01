@@ -717,6 +717,125 @@ def normalize_text(text: str) -> str:
 def parse_lines(text: str) -> List[str]:
     return [x.strip() for x in (text or "").splitlines() if x.strip()]
 
+
+@dataclass
+class TelegramTarget:
+    """A Telegram posting target with optional forum topic/thread support.
+
+    Supported user-facing formats:
+    - @channel_or_group
+    - -1001234567890
+    - @group|456
+    - -1001234567890|456
+    - https://t.me/groupname|456
+    - https://t.me/groupname/456
+    - https://t.me/c/1234567890/456
+
+    The number after `|` or at the end of a Telegram topic link is used as
+    Telegram forum `message_thread_id` for Bot API and as `reply_to` for
+    Telethon.
+    """
+
+    chat: str
+    topic_id: Optional[int] = None
+    original: str = ""
+
+    @property
+    def label(self) -> str:
+        return f"{self.chat}|{self.topic_id}" if self.topic_id else self.chat
+
+
+def _clean_telegram_target_value(value: str) -> str:
+    value = (value or "").strip()
+    value = value.strip("`\'\" ")
+    return value.rstrip("/")
+
+
+def _parse_int_maybe(value: str) -> Optional[int]:
+    value = (value or "").strip()
+    return int(value) if re.fullmatch(r"\d+", value) else None
+
+
+def parse_telegram_target(raw: str, *, for_bot_api: bool = False) -> Optional[TelegramTarget]:
+    """Parse a Telegram channel/group target and optional topic/thread ID.
+
+    Telegram forum topics are not separate chats. To send into a topic, Telegram
+    requires `message_thread_id` (Bot API) or a reply to the topic starter
+    message/top message (Telethon). This parser keeps normal targets backward
+    compatible and adds `chat|topic_id` plus topic-link support.
+    """
+    original = (raw or "").strip()
+    raw = _clean_telegram_target_value(original)
+    if not raw:
+        return None
+
+    topic_id: Optional[int] = None
+    chat = raw
+
+    # Explicit and safest syntax: target|topic_id
+    if "|" in raw:
+        left, right = raw.rsplit("|", 1)
+        maybe_topic = _parse_int_maybe(right)
+        if maybe_topic is not None:
+            chat = _clean_telegram_target_value(left)
+            topic_id = maybe_topic
+
+    # Alternative syntax: target topic_id=123 or target thread_id=123
+    if topic_id is None:
+        m = re.search(r"\s+(?:topic_id|thread_id|message_thread_id)\s*=\s*(\d+)\s*$", chat, flags=re.I)
+        if m:
+            topic_id = int(m.group(1))
+            chat = _clean_telegram_target_value(chat[:m.start()])
+
+    parsed = urlparse(chat)
+    if parsed.scheme in {"http", "https"} and parsed.netloc.lower() in {"t.me", "telegram.me"}:
+        parts = [p for p in parsed.path.split("/") if p]
+        # Private/supergroup link style: https://t.me/c/<internal_id>/<message_or_topic_id>
+        if len(parts) >= 3 and parts[0] == "c" and parts[1].isdigit():
+            internal_id = parts[1]
+            if topic_id is None and parts[2].isdigit():
+                topic_id = int(parts[2])
+            chat = f"-100{internal_id}"
+        # Public link style: https://t.me/<username>/<message_or_topic_id>
+        elif len(parts) >= 2 and parts[1].isdigit():
+            if topic_id is None:
+                topic_id = int(parts[1])
+            username = parts[0]
+            chat = f"@{username}" if for_bot_api else f"https://t.me/{username}"
+        elif len(parts) >= 1:
+            username = parts[0]
+            chat = f"@{username}" if for_bot_api else f"https://t.me/{username}"
+
+    # Bot API does not accept https://t.me/... as chat_id. Normalize public URLs to @username.
+    if for_bot_api:
+        parsed = urlparse(chat)
+        if parsed.scheme in {"http", "https"} and parsed.netloc.lower() in {"t.me", "telegram.me"}:
+            parts = [p for p in parsed.path.split("/") if p]
+            if parts and parts[0] != "c":
+                chat = f"@{parts[0]}"
+
+    chat = _clean_telegram_target_value(chat)
+    if not chat:
+        return None
+    return TelegramTarget(chat=chat, topic_id=topic_id, original=original)
+
+
+def parse_telegram_targets(text_or_lines: Any, *, for_bot_api: bool = False) -> List[TelegramTarget]:
+    lines = text_or_lines if isinstance(text_or_lines, list) else parse_lines(str(text_or_lines or ""))
+    out: List[TelegramTarget] = []
+    seen = set()
+    for line in lines:
+        target = parse_telegram_target(line, for_bot_api=for_bot_api)
+        if not target:
+            continue
+        key = (target.chat, target.topic_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(target)
+    return out
+
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -2176,31 +2295,45 @@ class TelegramService:
         if not bot_token or not chat_ids:
             return
         image_path = self._valid_image_path(image_path)
-        for i, chat_id in enumerate(chat_ids, start=1):
+        targets = parse_telegram_targets(chat_ids, for_bot_api=True)
+        if not targets:
+            logger.info("No valid Telegram Bot API targets configured.")
+            return
+
+        for i, target in enumerate(targets, start=1):
             if image_path:
+                payload = {
+                    "chat_id": target.chat,
+                    "caption": self._telegram_caption(text),
+                }
+                if target.topic_id:
+                    payload["message_thread_id"] = target.topic_id
                 with open(image_path, "rb") as f:
                     r = requests.post(
                         f"https://api.telegram.org/bot{bot_token}/sendPhoto",
-                        data={
-                            "chat_id": chat_id,
-                            "caption": self._telegram_caption(text),
-                        },
+                        data=payload,
                         files={"photo": (Path(image_path).name, f, "image/png")},
                         timeout=60,
                     )
             else:
+                payload = {
+                    "chat_id": target.chat,
+                    "text": (text or "")[:4096],
+                    "disable_web_page_preview": False,
+                }
+                if target.topic_id:
+                    payload["message_thread_id"] = target.topic_id
                 r = requests.post(
                     f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                    json={
-                        "chat_id": chat_id,
-                        "text": (text or "")[:4096],
-                        "disable_web_page_preview": False,
-                    },
+                    json=payload,
                     timeout=30,
                 )
             if r.status_code not in (200, 201):
-                raise RuntimeError(f"Telegram Bot API send failed for {chat_id}: HTTP {r.status_code} | {r.text[:500]}")
-            logger.info(f"✅ Telegram Bot API social [{i}/{len(chat_ids)}] {chat_id}")
+                raise RuntimeError(f"Telegram Bot API send failed for {target.label}: HTTP {r.status_code} | {r.text[:500]}")
+            if target.topic_id:
+                logger.info(f"✅ Telegram Bot API social [{i}/{len(targets)}] {target.chat} topic={target.topic_id}")
+            else:
+                logger.info(f"✅ Telegram Bot API social [{i}/{len(targets)}] {target.chat}")
 
     async def send_social_post(self, text: str, image_path: str | None = None):
         cfg = self.cfg_getter()
@@ -2213,11 +2346,11 @@ class TelegramService:
             await asyncio.to_thread(self.send_telegram_bot_api, text, bot_token, bot_chat_ids, image_path)
             return
 
-        targets = []
+        raw_targets = []
         if getattr(cfg, "telegram_post_channel_url", "").strip():
-            targets.append(cfg.telegram_post_channel_url.strip())
-        targets.extend(parse_lines(cfg.telegram_target_channels))
-        targets = list(dict.fromkeys([x for x in targets if x]))
+            raw_targets.append(cfg.telegram_post_channel_url.strip())
+        raw_targets.extend(parse_lines(cfg.telegram_target_channels))
+        targets = parse_telegram_targets(raw_targets)
 
         if not targets:
             logger.info("No Telegram targets configured for social posting.")
@@ -2240,13 +2373,17 @@ class TelegramService:
 
         for i, target in enumerate(targets, start=1):
             try:
-                logger.info(f"📨 Telegram social [{i}/{len(targets)}] {target}")
-                valid_image = self._valid_image_path(image_path)
-                if valid_image:
-                    await client.send_file(target, valid_image, caption=self._telegram_caption(text))
+                if target.topic_id:
+                    logger.info(f"📨 Telegram social [{i}/{len(targets)}] {target.chat} topic={target.topic_id}")
                 else:
-                    await client.send_message(target, text)
-                logger.info(f"✅ Posted to Telegram social target: {target}")
+                    logger.info(f"📨 Telegram social [{i}/{len(targets)}] {target.chat}")
+                valid_image = self._valid_image_path(image_path)
+                send_kwargs = {"reply_to": target.topic_id} if target.topic_id else {}
+                if valid_image:
+                    await client.send_file(target.chat, valid_image, caption=self._telegram_caption(text), **send_kwargs)
+                else:
+                    await client.send_message(target.chat, text, **send_kwargs)
+                logger.info(f"✅ Posted to Telegram social target: {target.label}")
                 await asyncio.sleep(2)
             except FloodWaitError as e:
                 logger.warning(f"FloodWait {e.seconds}s")
@@ -2283,7 +2420,7 @@ class TelegramService:
             try:
                 cfg = self.cfg_getter()
                 source = cfg.telegram_source_channel.strip()
-                targets = parse_lines(cfg.telegram_target_channels)
+                targets = parse_telegram_targets(cfg.telegram_target_channels)
 
                 if not source or not targets:
                     await asyncio.sleep(10)
@@ -2362,12 +2499,16 @@ class TelegramService:
 
                     for target in targets:
                         try:
+                            send_kwargs = {"reply_to": target.topic_id} if target.topic_id else {}
                             if media_files:
-                                await client.send_file(target, media_files, caption=final_text)
+                                await client.send_file(target.chat, media_files, caption=final_text, **send_kwargs)
                             else:
-                                await client.send_message(target, final_text)
+                                await client.send_message(target.chat, final_text, **send_kwargs)
 
-                            logger.info(f"✅ Forward OK: {target}")
+                            if target.topic_id:
+                                logger.info(f"✅ Forward OK: {target.chat} topic={target.topic_id}")
+                            else:
+                                logger.info(f"✅ Forward OK: {target.chat}")
                             await asyncio.sleep(3)
 
                         except FloodWaitError as e:
@@ -2375,7 +2516,7 @@ class TelegramService:
                             await asyncio.sleep(e.seconds)
 
                         except Exception as e:
-                            logger.error(f"Forward error {target}: {e}")
+                            logger.error(f"Forward error {target.label}: {e}")
 
                     for f in media_files:
                         try:
